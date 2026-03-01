@@ -6,7 +6,7 @@ import plotly.graph_objects as go
 import pickle
 import io
 from PIL import Image
-from docs import OVERVIEW, GUI_GUIDE, MODEL_ARCH, INPUT_FORMAT, RESULTS
+from docs import OVERVIEW, GUI_GUIDE, MODEL_ARCH
 
 # --- Page Configuration ---
 st.set_page_config(page_title="MOmics-ML", layout="wide", page_icon="🧬")
@@ -69,15 +69,15 @@ st.markdown("""
 @st.cache_resource
 def load_assets():
     try:
-        with open('momics_xgb_model (1).pkl', 'rb') as f:
+        with open('momics_xgb_model-1.pkl', 'rb') as f:
             model = pickle.load(f)
-        with open('imputer (1).pkl', 'rb') as f:
+        with open('imputer-1.pkl', 'rb') as f:
             imputer = pickle.load(f)
         if not hasattr(imputer, '_fill_dtype') and hasattr(imputer, '_fit_dtype'):
             imputer._fill_dtype = imputer._fit_dtype
-        with open('scaler (1).pkl', 'rb') as f:
+        with open('scaler-1.pkl', 'rb') as f:
             scaler = pickle.load(f)
-        with open('feature_list (1).pkl', 'rb') as f:
+        with open('feature_list-1.pkl', 'rb') as f:
             feature_list = pickle.load(f)
         feature_names = list(model.feature_names_in_)
         importances = model.feature_importances_
@@ -419,23 +419,13 @@ if page == "Home":
 # ============================================================================
 elif page == "Documentation":
     st.header("System Documentation")
-    doc_tabs = st.tabs([
-        "Overview",
-        "GUI User Guide",
-        "Model Architecture",
-        "Input Data Format",
-        "Interpreting Results"
-    ])
+    doc_tabs = st.tabs(["Overview", "GUI User Guide", "Model Architecture"])
     with doc_tabs[0]:
         st.markdown(OVERVIEW)
     with doc_tabs[1]:
         st.markdown(GUI_GUIDE)
     with doc_tabs[2]:
         st.markdown(MODEL_ARCH)
-    with doc_tabs[3]:
-        st.markdown(INPUT_FORMAT)
-    with doc_tabs[4]:
-        st.markdown(RESULTS)
 
 elif page == "User Analysis":
     st.header("User Analysis")
@@ -676,4 +666,3 @@ elif page == "Demo Walkthrough":
         for key in keys_to_clear:
             del st.session_state[key]
         st.rerun()
-
