@@ -69,15 +69,15 @@ st.markdown("""
 @st.cache_resource
 def load_assets():
     try:
-        with open('momics_xgb_model-1.pkl', 'rb') as f:
+        with open('momics_xgb_model (1).pkl', 'rb') as f:
             model = pickle.load(f)
-        with open('imputer-1.pkl', 'rb') as f:
+        with open('imputer (1).pkl', 'rb') as f:
             imputer = pickle.load(f)
         if not hasattr(imputer, '_fill_dtype') and hasattr(imputer, '_fit_dtype'):
             imputer._fill_dtype = imputer._fit_dtype
-        with open('scaler-1.pkl', 'rb') as f:
+        with open('scaler (1).pkl', 'rb') as f:
             scaler = pickle.load(f)
-        with open('feature_list-1.pkl', 'rb') as f:
+        with open('feature_list (1).pkl', 'rb') as f:
             feature_list = pickle.load(f)
         feature_names = list(model.feature_names_in_)
         importances = model.feature_importances_
@@ -676,3 +676,4 @@ elif page == "Demo Walkthrough":
         for key in keys_to_clear:
             del st.session_state[key]
         st.rerun()
+
