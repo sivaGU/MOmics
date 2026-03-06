@@ -9,7 +9,7 @@ from PIL import Image
 from docs import OVERVIEW, GUI_GUIDE, MODEL_ARCH
 
 # --- Page Configuration ---
-st.set_page_config(page_title="MOmics", layout="wide", page_icon="🧬")
+st.set_page_config(page_title="MOmics-ML", layout="wide", page_icon="🧬")
 
 # --- Custom CSS for Blue Theme ---
 st.markdown("""
@@ -69,15 +69,15 @@ st.markdown("""
 @st.cache_resource
 def load_assets():
     try:
-        with open('momics_xgb_model (1).pkl', 'rb') as f:
+        with open('momics_xgb_model-1.pkl', 'rb') as f:
             model = pickle.load(f)
-        with open('imputer (1).pkl', 'rb') as f:
+        with open('imputer-1.pkl', 'rb') as f:
             imputer = pickle.load(f)
         if not hasattr(imputer, '_fill_dtype') and hasattr(imputer, '_fit_dtype'):
             imputer._fill_dtype = imputer._fit_dtype
-        with open('scaler (1).pkl', 'rb') as f:
+        with open('scaler-1.pkl', 'rb') as f:
             scaler = pickle.load(f)
-        with open('feature_list (1).pkl', 'rb') as f:
+        with open('feature_list-1.pkl', 'rb') as f:
             feature_list = pickle.load(f)
         feature_names = list(model.feature_names_in_)
         importances = model.feature_importances_
@@ -396,11 +396,11 @@ def render_dashboard(results, mode="manual", key_prefix="", patient_labels=None)
         st.dataframe(patient_all_markers, use_container_width=True, hide_index=True)
 
 # --- SIDEBAR NAVIGATION ---
-st.sidebar.title("MOmics")
+st.sidebar.title("MOmics-ML")
 st.sidebar.markdown("---")
 page = st.sidebar.radio("Navigation", ["Home", "Documentation", "User Analysis", "Demo Walkthrough"])
 
-st.title("MOmics | GBM Clinical Diagnostic Suite")
+st.title("MOmics-ML | GBM Clinical Diagnostic Suite")
 
 # ============================================================================
 # HOME PAGE
@@ -411,7 +411,7 @@ if page == "Home":
         st.image(logo, use_container_width=True)
     except:
         st.info("Logo image not found. Please ensure 'logo.png' is in the root directory.")
-    st.markdown("<h1 style='text-align: center;'>MOmics</h1>", unsafe_allow_html=True)
+    st.markdown("<h1 style='text-align: center;'>MOmics-ML</h1>", unsafe_allow_html=True)
     st.markdown("<h3 style='text-align: center;'>GBM Clinical Diagnostic Suite</h3>", unsafe_allow_html=True)
 
 # ============================================================================
@@ -429,7 +429,7 @@ elif page == "Documentation":
 
 elif page == "User Analysis":
     st.header("User Analysis")
-    analysis_tabs = st.tabs(["Manual Patient Entry", "Bulk Data Upload"])
+    analysis_tabs = st.tabs(["Manual Patient Entry", "Bulk Data Upload", "Example Analysis"])
     with analysis_tabs[0]:
         st.subheader("Manual Patient Entry")
         st.info("Input raw laboratory values. Markers left at 0.0 will be treated as baseline. Click 'Analyze Single Patient' to see results.")
@@ -493,6 +493,79 @@ elif page == "User Analysis":
             except Exception as e:
                 st.error(f"Error processing file: {e}")
                 st.info("Please ensure your CSV file follows the template format.")
+
+    # ── EXAMPLE ANALYSIS TAB ─────────────────────────────────────────────────
+    with analysis_tabs[2]:
+        st.subheader("Example Analysis")
+        st.write("""
+        This tab runs a real analysis on a CPTAC GBM patient sample processed from
+        GDC RNA-seq data. The input file (`momics_input.csv`) contains raw STAR
+        unstranded counts for all 100 model features, prepared from a single
+        10x Visium-compatible CPTAC-3 sample.
+
+        Click **Run Example Analysis** to see the full results dashboard.
+        """)
+
+        col_ex1, col_ex2 = st.columns([1, 2])
+        with col_ex1:
+            st.markdown("**Input file:** `momics_input.csv`")
+            st.markdown("**Sample:** CPTAC-3 GBM patient")
+            st.markdown("**Features:** 100 RNA model features")
+            st.markdown("**Format:** Raw unstranded STAR counts")
+
+            if st.button("Run Example Analysis", type="primary", key="btn_example"):
+                try:
+                    example_df = pd.read_csv("2momics_input.csv")
+                    st.session_state.example_results = process_data(example_df)
+                    st.session_state.example_ran = True
+                except FileNotFoundError:
+                    st.error(
+                        "`momics_input.csv` not found. Ensure the file is in the "
+                        "repo root alongside the main app file."
+                    )
+                except Exception as e:
+                    st.error(f"Error running example: {e}")
+
+            if st.session_state.get("example_ran"):
+                if st.button("Clear Results", key="btn_example_clear"):
+                    st.session_state.pop("example_results", None)
+                    st.session_state.pop("example_ran", None)
+                    st.rerun()
+
+        with col_ex2:
+            with st.expander("Preview: what's in momics_input.csv?"):
+                try:
+                    preview_df = pd.read_csv("momics_input.csv")
+                    # Show just the 7 key feature columns
+                    key_features = [
+                        "RNA_ENSG00000244040.4",  # LINC02084
+                        "RNA_ENSG00000164061.4",  # BTF3L4
+                        "RNA_ENSG00000206814.1",  # RNU6-1
+                        "RNA_ENSG00000181215.11", # MS4A6E
+                        "RNA_ENSG00000157445.13", # CACNA2D3
+                        "RNA_ENSG00000233487.6",  # LINC01605
+                        "RNA_ENSG00000242759.5",  # LINC01116
+                    ]
+                    present = [f for f in key_features if f in preview_df.columns]
+                    if present:
+                        display_df = preview_df[present].copy()
+                        display_df.columns = [
+                            f"{to_gene(c)} ({c})" for c in display_df.columns
+                        ]
+                        st.markdown("**7 key model features (all 100 present in file):**")
+                        st.dataframe(display_df.T.rename(columns={0: "Raw Count"}),
+                                     use_container_width=True)
+                except FileNotFoundError:
+                    st.info("`momics_input.csv` will appear here once added to the repo.")
+
+        if st.session_state.get("example_ran") and "example_results" in st.session_state:
+            st.divider()
+            st.subheader("Example Results")
+            render_dashboard(
+                st.session_state.example_results,
+                mode="bulk",
+                key_prefix="ex"
+            )
 
 # ============================================================================
 # DEMO WALKTHROUGH PAGE
@@ -666,5 +739,3 @@ elif page == "Demo Walkthrough":
         for key in keys_to_clear:
             del st.session_state[key]
         st.rerun()
-
-
