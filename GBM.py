@@ -9,7 +9,7 @@ from PIL import Image
 from docs import OVERVIEW, GUI_GUIDE, MODEL_ARCH
 
 # --- Page Configuration ---
-st.set_page_config(page_title="MOmics-ML", layout="wide", page_icon="🧬")
+st.set_page_config(page_title="MOmics", layout="wide", page_icon="🧬")
 
 # --- Custom CSS for Blue Theme ---
 st.markdown("""
@@ -19,6 +19,7 @@ st.markdown("""
     }
     [data-testid="stSidebar"] [data-testid="stMarkdownContainer"] {
         color: #ffffff;
+        font-size: 12px;
     }
     header[data-testid="stHeader"] {
         background-color: #5dade2;
@@ -30,6 +31,7 @@ st.markdown("""
         border-radius: 5px;
         padding: 0.5rem 1rem;
         font-weight: 500;
+        font-size: 12px;
     }
     .stButton > button:hover {
         background-color: #3498db;
@@ -40,12 +42,14 @@ st.markdown("""
         border: none;
         border-radius: 5px;
         font-weight: 500;
+        font-size: 12px;
     }
     .stDownloadButton > button:hover {
         background-color: #3498db;
     }
     [data-testid="stSidebar"] .stRadio > label {
         color: #ffffff;
+        font-size: 12px;
     }
     .demo-box {
         background-color: #e8f4f8;
@@ -53,6 +57,7 @@ st.markdown("""
         border-radius: 10px;
         border-left: 5px solid #5dade2;
         margin: 10px 0;
+        font-size: 12px;
     }
     .demo-success {
         background-color: #d5f4e6;
@@ -61,6 +66,20 @@ st.markdown("""
     .demo-warning {
         background-color: #fff3cd;
         border-left-color: #f39c12;
+    }
+    /* Global font size override — excludes h1/h2/h3 titles */
+    p, li, label, .stMarkdown p, .stMarkdown li,
+    [data-testid="stText"], [data-testid="stMetricLabel"],
+    [data-testid="stMetricValue"], .stDataFrame,
+    .stSelectbox label, .stFileUploader label,
+    .stNumberInput label, .stRadio label,
+    .stExpander summary, .stAlert p,
+    div[data-testid="stInfoBox"] p,
+    div[data-testid="stSuccessBox"] p,
+    div[data-testid="stWarningBox"] p,
+    div[data-testid="stErrorBox"] p,
+    .stTabs [data-baseweb="tab"] {
+        font-size: 12px !important;
     }
     </style>
 """, unsafe_allow_html=True)
@@ -213,11 +232,6 @@ importance_df_display['Biomarker'] = importance_df_display['Biomarker'].apply(to
 # =============================================================================
 # DEMO DATA — loaded from TGCA_DEMO_DATA.csv
 # =============================================================================
-# Contains 4 real GBM patients (CPTAC cohort) with 6 of 7 critical model
-# features present as RNA_ENSG Ensembl IDs. CACNA2D3 (RNA_ENSG00000157445.13,
-# importance 13.8%) was not available and is imputed to the training median
-# (170 read counts). Predictions are differentiated: 2 Low Risk, 2 High Risk.
-# =============================================================================
 DEMO_CSV_PATH = 'TGCA_DEMO_DATA.csv'
 
 @st.cache_data
@@ -225,11 +239,9 @@ def load_demo_data():
     """Load real GBM patient data from TGCA_DEMO_DATA.csv."""
     try:
         df = pd.read_csv(DEMO_CSV_PATH)
-        # Handle both 'Sample ID' (space) and 'Sample_ID' (underscore)
         id_col = 'Sample ID' if 'Sample ID' in df.columns else 'Sample_ID'
         sample_ids = df[id_col].tolist() if id_col in df.columns else [f"Patient {i}" for i in range(len(df))]
         df_data = df.drop(columns=[id_col], errors='ignore')
-        # Columns are already RNA_ENSG format — remap any gene symbols just in case
         df_data = df_data.rename(columns=lambda c: GENE_TO_ENSEMBL.get(c, c))
         return df_data, sample_ids
     except FileNotFoundError:
@@ -396,11 +408,11 @@ def render_dashboard(results, mode="manual", key_prefix="", patient_labels=None)
         st.dataframe(patient_all_markers, use_container_width=True, hide_index=True)
 
 # --- SIDEBAR NAVIGATION ---
-st.sidebar.title("MOmics-ML")
+st.sidebar.title("MOmics")
 st.sidebar.markdown("---")
 page = st.sidebar.radio("Navigation", ["Home", "Documentation", "User Analysis", "Demo Walkthrough"])
 
-st.title("MOmics-ML | GBM Clinical Diagnostic Suite")
+st.title("MOmics | GBM Clinical Diagnostic Suite")
 
 # ============================================================================
 # HOME PAGE
@@ -411,7 +423,7 @@ if page == "Home":
         st.image(logo, use_container_width=True)
     except:
         st.info("Logo image not found. Please ensure 'logo.png' is in the root directory.")
-    st.markdown("<h1 style='text-align: center;'>MOmics-ML</h1>", unsafe_allow_html=True)
+    st.markdown("<h1 style='text-align: center;'>MOmics</h1>", unsafe_allow_html=True)
     st.markdown("<h3 style='text-align: center;'>GBM Clinical Diagnostic Suite</h3>", unsafe_allow_html=True)
 
 # ============================================================================
@@ -536,15 +548,14 @@ elif page == "User Analysis":
             with st.expander("Preview: what's in momics_input.csv?"):
                 try:
                     preview_df = pd.read_csv("momics_input.csv")
-                    # Show just the 7 key feature columns
                     key_features = [
-                        "RNA_ENSG00000244040.4",  # LINC02084
-                        "RNA_ENSG00000164061.4",  # BTF3L4
-                        "RNA_ENSG00000206814.1",  # RNU6-1
-                        "RNA_ENSG00000181215.11", # MS4A6E
-                        "RNA_ENSG00000157445.13", # CACNA2D3
-                        "RNA_ENSG00000233487.6",  # LINC01605
-                        "RNA_ENSG00000242759.5",  # LINC01116
+                        "RNA_ENSG00000244040.4",
+                        "RNA_ENSG00000164061.4",
+                        "RNA_ENSG00000206814.1",
+                        "RNA_ENSG00000181215.11",
+                        "RNA_ENSG00000157445.13",
+                        "RNA_ENSG00000233487.6",
+                        "RNA_ENSG00000242759.5",
                     ]
                     present = [f for f in key_features if f in preview_df.columns]
                     if present:
@@ -739,4 +750,3 @@ elif page == "Demo Walkthrough":
         for key in keys_to_clear:
             del st.session_state[key]
         st.rerun()
-
