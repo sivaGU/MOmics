@@ -1,1 +1,1 @@
-# MOmics-ML
+# MOmics
