@@ -1,7 +1,7 @@
 # MOmics
 
 All R and Python codes used for MOmics: A machine learning-driven Multi-Omics Integration Identifies Diagnostic Biomarkers and Therapeutic Targets in Glioblastoma study. 
-GUI Link: 
+GUI Link: https://momics-gbm.streamlit.app/
 
 Files: 
   1. GBM Single-Omics-Metabolomics: 
@@ -22,4 +22,4 @@ MOmics-GUI:
 Usage Workflow: 
 
 Contant: 
-Questions, bug reports, or collaboration requests: Dr. Sivanesan Dakshanamurthy — sd233@georgetown.edu
+Questions and bug reports, please contact: Dr. Sivanesan Dakshanamurthy: sd233@georgetown.edu
