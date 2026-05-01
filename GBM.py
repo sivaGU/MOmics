@@ -518,7 +518,7 @@ elif page == "User Analysis":
                     disabled=not rna_enabled
                 )
 
-        st.write("#### Protein Biomarkers (log2 abundance)")
+        st.write("#### Protein Biomarkers")
         prot_cols = st.columns(4)
         for i, feat in enumerate(PROT_FEATURES):
             with prot_cols[i % 4]:
@@ -528,7 +528,7 @@ elif page == "User Analysis":
                     disabled=not prot_enabled
                 )
 
-        st.write("#### Metabolomics Biomarkers (log2 abundance)")
+        st.write("#### Metabolomics Biomarkers ")
         met_cols = st.columns(3)
         for i, feat in enumerate(MET_FEATURES):
             with met_cols[i % 3]:
