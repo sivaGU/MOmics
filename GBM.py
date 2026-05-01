@@ -497,7 +497,7 @@ elif page == "User Analysis":
         st.subheader("Manual Patient Entry")
         st.info(
             "**RNA:** enter raw read counts (log1p applied internally). "
-            "**Protein & Metabolomics:** enter log2 abundances (CPTAC standard). "
+            
             "Do not pre-normalize. Leave a field at 0.0 to fill with training mean. "
             "Uncheck a layer to exclude it — the fusion model handles missing layers natively."
         )
