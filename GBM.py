@@ -3,8 +3,7 @@ import pandas as pd
 import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
-import pickle
-from scipy.stats import rankdata
+import joblib
 from docs import OVERVIEW, GUI_GUIDE, MODEL_ARCH
 
 # --- Page Configuration ---
@@ -74,148 +73,143 @@ st.markdown("""
 
 
 # =============================================================================
-# ASSET LOADING
+# PIPELINE LOADING
 # =============================================================================
 @st.cache_resource
-def load_assets():
-    with open('momics_rna_model.pkl', 'rb') as f:
-        rna_pkg = pickle.load(f)
-    with open('momics_prot_model.pkl', 'rb') as f:
-        prot_pkg = pickle.load(f)
-    with open('momics_met_model.pkl', 'rb') as f:
-        met_pkg = pickle.load(f)
-    with open('momics_fusion_model.pkl', 'rb') as f:
-        fusion_pkg = pickle.load(f)
-    with open('momics_feature_metadata.pkl', 'rb') as f:
-        feature_metadata = pickle.load(f)
-    with open('momics_reference_ranges.pkl', 'rb') as f:
-        reference_ranges = pickle.load(f)
-    return rna_pkg, prot_pkg, met_pkg, fusion_pkg, feature_metadata, reference_ranges
+def load_pipeline():
+    return joblib.load("MOmics_v11_locked_pipeline.pkl")
 
-rna_pkg, prot_pkg, met_pkg, fusion_pkg, feature_metadata, reference_ranges = load_assets()
+pipe = load_pipeline()
+
+# Unpack everything we need from the single artifact
+PRUNED         = pipe["pruned_features"]       # {'rna': [...], 'prot': [...], 'met': [...]}
+SUB_MODELS     = pipe["sub_models"]            # {'rna': XGB, 'prot': XGB, 'met': XGB}
+FUSION_MODEL   = pipe["fusion_model"]          # XGBClassifier
+ZSCORE_PARAMS  = pipe["zscore_params"]         # {'rna': {'mean': {f: μ}, 'std': {f: σ}}, ...}
+THRESHOLD      = pipe["youden_threshold"]      # 0.9641
+RNA_LOG1P      = pipe["rna_log1p_required"]    # True
+CALIBRATOR     = pipe["isotonic_calibrator"]   # IsotonicRegression
+DISCOVERY      = pipe["discovery_metrics"]
+SYMBOL_TO_ENSG = pipe["symbol_to_ensg"]
+
+RNA_FEATURES  = PRUNED["rna"]   # ['BSN', 'PCLO', 'PRKCE', 'PTPRT', 'CIT', 'MAPT']
+PROT_FEATURES = PRUNED["prot"]  # ['PTPRT', 'CIT', 'PCLO', 'BSN']
+MET_FEATURES  = PRUNED["met"]   # ['hypotaurine', 'creatinine', 'citricacid']
+ALL_FEATURES  = RNA_FEATURES + PROT_FEATURES + MET_FEATURES
+
+SCORE_COLS = ["Prediction", "Risk Score (Raw)", "Risk Score (Calibrated)",
+              "Binary Call", "RNA Score", "Protein Score", "Metabolomics Score"]
 
 
 # =============================================================================
-# FEATURE HELPERS
+# FEATURE IMPORTANCE DF
 # =============================================================================
-
-# Build lookup dicts from feature_metadata
-# feature_metadata = {'rna': [{ensembl, symbol, name}, ...], 'prot': [...], 'met': [...]}
-def _build_lookups():
-    id_to_symbol = {}
-    id_to_name   = {}
-    symbol_to_id = {}
-    for layer_key in ('rna', 'prot', 'met'):
-        for entry in feature_metadata.get(layer_key, []):
-            eid = entry['ensembl'] or entry['symbol']  # met has no ensembl
-            sym = entry['symbol'] or eid
-            name = entry['name'] or sym
-            id_to_symbol[eid] = sym
-            id_to_name[eid]   = name
-            symbol_to_id[sym] = eid
-    return id_to_symbol, id_to_name, symbol_to_id
-
-ID_TO_SYMBOL, ID_TO_NAME, SYMBOL_TO_ID = _build_lookups()
-
-def to_symbol(feat_id):
-    return ID_TO_SYMBOL.get(str(feat_id), str(feat_id))
-
-def to_name(feat_id):
-    return ID_TO_NAME.get(str(feat_id), str(feat_id))
-
-# All features ordered: RNA first, then PROT, then MET
-ALL_FEATURES = rna_pkg['features'] + prot_pkg['features'] + met_pkg['features']
-ALL_SYMBOLS  = rna_pkg['feature_symbols'] + prot_pkg['feature_symbols'] + met_pkg['feature_symbols']
-
-# Combined importance DataFrame (for display)
 def _build_importance_df():
     rows = []
-    for pkg, layer in [(rna_pkg, 'RNA'), (prot_pkg, 'Protein'), (met_pkg, 'Metabolomics')]:
-        syms = pkg.get('feature_symbols', pkg['features'])
-        imps = pkg['model'].feature_importances_
-        for sym, imp in zip(syms, imps):
-            rows.append({'Biomarker': sym, 'Influence Score': float(imp), 'Layer': layer})
-    return pd.DataFrame(rows).sort_values('Influence Score', ascending=False).reset_index(drop=True)
+    layer_map = {"rna": "RNA", "prot": "Protein", "met": "Metabolomics"}
+    for layer_key, label in layer_map.items():
+        feats = PRUNED[layer_key]
+        model = SUB_MODELS[layer_key]
+        for feat, imp in zip(feats, model.feature_importances_):
+            rows.append({"Biomarker": feat, "Influence Score": float(imp), "Layer": label})
+    return pd.DataFrame(rows).sort_values("Influence Score", ascending=False).reset_index(drop=True)
 
 importance_df_display = _build_importance_df()
 
 
 # =============================================================================
-# PREDICTION PIPELINE
+# INFERENCE PIPELINE
 # =============================================================================
 
-def _rank_transform(values_array):
-    """Rank-transform within sample to [0, 1]."""
-    arr = np.asarray(values_array, dtype=float)
-    if len(arr) <= 1:
-        return np.array([0.5])
-    ranks = rankdata(arr, method='average')
-    return (ranks - 1) / (len(ranks) - 1)
+def _zscore(value, mean, std):
+    if std is None or np.isnan(std) or std == 0:
+        return 0.0
+    if mean is None or np.isnan(mean):
+        return 0.0
+    return (value - mean) / std
 
 
-def _layer_prob(pkg, user_dict):
+def _prepare_layer(layer_key, user_dict):
     """
-    Compute a layer's GBM probability.
-    user_dict: {feature_id: raw_value}  or None if layer not available.
-    Missing features are filled with gbm_mean from reference_ranges.
+    Z-score normalize a layer's input dict.
+    RNA: log1p applied first. Missing features within a provided layer filled with 0 (z-score mean).
+    Returns (1, n_features) array, or None if user_dict is None.
     """
     if user_dict is None:
-        return np.nan
-    features = pkg['features']
-    ref      = pkg['reference_ranges']
-    raw = np.array([
-        user_dict.get(f, ref[f]['gbm_mean']) for f in features
-    ], dtype=float)
-    ranked = _rank_transform(raw)
-    return float(pkg['model'].predict_proba(ranked.reshape(1, -1))[:, 1][0])
+        return None
+
+    features = PRUNED[layer_key]
+    means    = ZSCORE_PARAMS[layer_key]["mean"]
+    stds     = ZSCORE_PARAMS[layer_key]["std"]
+
+    row = []
+    for f in features:
+        raw = user_dict.get(f, None)
+        if raw is None or (isinstance(raw, float) and np.isnan(raw)):
+            row.append(0.0)
+        else:
+            val = np.log1p(float(raw)) if (layer_key == "rna" and RNA_LOG1P) else float(raw)
+            row.append(_zscore(val, means.get(f), stds.get(f)))
+
+    return np.array(row, dtype=float).reshape(1, -1)
 
 
-def predict_patient(rna_dict, prot_dict, met_dict):
+def score_sample(rna_dict, prot_dict, met_dict):
     """
-    Run the full 3-layer → fusion pipeline for one patient.
-    Each dict is {feature_id: raw_value} or None.
-    Returns dict with all scores.
+    Full inference: z-score → 3 sub-models → fusion → calibration.
+    Each dict is {symbol: raw_value} or None if layer unavailable.
+    Binary call uses raw probability vs Youden threshold.
     """
-    rna_prob  = _layer_prob(rna_pkg,  rna_dict)
-    prot_prob = _layer_prob(prot_pkg, prot_dict)
-    met_prob  = _layer_prob(met_pkg,  met_dict)
+    layer_probs  = []
+    layer_scores = {}
 
-    fusion_input = np.array([[rna_prob, prot_prob, met_prob]])
-    gbm_prob = float(fusion_pkg['model'].predict_proba(fusion_input)[:, 1][0])
-    is_gbm   = gbm_prob >= fusion_pkg['decision_threshold_default']
+    for layer_key, user_dict, label in [
+        ("rna",  rna_dict,  "RNA Score"),
+        ("prot", prot_dict, "Protein Score"),
+        ("met",  met_dict,  "Metabolomics Score"),
+    ]:
+        arr = _prepare_layer(layer_key, user_dict)
+        if arr is None:
+            layer_probs.append(np.nan)
+            layer_scores[label] = None
+        else:
+            p = float(SUB_MODELS[layer_key].predict_proba(arr)[:, 1][0])
+            layer_probs.append(p)
+            layer_scores[label] = p
+
+    fusion_input = np.array([layer_probs])  # NaN → XGBoost handles natively
+    raw_prob     = float(FUSION_MODEL.predict_proba(fusion_input)[:, 1][0])
+    cal_prob     = float(CALIBRATOR.predict([raw_prob])[0])
+    binary       = "GBM" if raw_prob >= THRESHOLD else "Non-GBM"
 
     return {
-        'Prediction':         'High Risk' if is_gbm else 'Low Risk',
-        'Risk Score':          gbm_prob,
-        'RNA Score':           rna_prob  if not np.isnan(rna_prob)  else None,
-        'Protein Score':       prot_prob if not np.isnan(prot_prob) else None,
-        'Metabolomics Score':  met_prob  if not np.isnan(met_prob)  else None,
+        "Prediction":              "High Risk" if raw_prob >= THRESHOLD else "Low Risk",
+        "Risk Score (Raw)":        raw_prob,
+        "Risk Score (Calibrated)": cal_prob,
+        "Binary Call":             binary,
+        **layer_scores,
     }
 
 
 def process_dataframe(df):
-    """
-    Process a DataFrame where columns are feature IDs or gene symbols.
-    Auto-detects and maps symbols → IDs.
-    Returns a results DataFrame.
-    """
-    # Remap any symbol columns to feature IDs
-    df = df.rename(columns=lambda c: SYMBOL_TO_ID.get(c, c))
+    """Score every row. Columns should be feature symbols; layer routing is automatic."""
+    rna_set  = set(RNA_FEATURES)
+    prot_set = set(PROT_FEATURES)
+    met_set  = set(MET_FEATURES)
 
     results = []
     for _, row in df.iterrows():
-        rna_dict  = {f: row[f] for f in rna_pkg['features']  if f in row.index and pd.notna(row[f])}
-        prot_dict = {f: row[f] for f in prot_pkg['features'] if f in row.index and pd.notna(row[f])}
-        met_dict  = {f: row[f] for f in met_pkg['features']  if f in row.index and pd.notna(row[f])}
+        def layer_dict(feat_set):
+            d = {f: row[f] for f in feat_set if f in row.index and pd.notna(row[f])}
+            return d if d else None
 
-        result = predict_patient(
-            rna_dict  if rna_dict  else None,
-            prot_dict if prot_dict else None,
-            met_dict  if met_dict  else None,
+        result = score_sample(
+            rna_dict  = layer_dict(rna_set),
+            prot_dict = layer_dict(prot_set),
+            met_dict  = layer_dict(met_set),
         )
-        # Attach original feature values for downstream display (symbol-keyed)
         for f in ALL_FEATURES:
-            result[to_symbol(f)] = float(row[f]) if f in row.index and pd.notna(row.get(f)) else np.nan
+            result[f] = float(row[f]) if f in row.index and pd.notna(row.get(f)) else np.nan
         results.append(result)
 
     return pd.DataFrame(results)
@@ -225,47 +219,71 @@ def process_dataframe(df):
 # VISUALIZATION HELPERS
 # =============================================================================
 
-SCORE_COLS = ['Prediction', 'Risk Score', 'RNA Score', 'Protein Score', 'Metabolomics Score']
+def _fmt(val):
+    if val is None or (isinstance(val, float) and np.isnan(val)):
+        return "N/A"
+    return f"{val:.4f}"
 
 
 def render_risk_charts(results, mode="manual", key_prefix=""):
     st.subheader("Prediction & Risk Assessment")
+
     if mode == "manual":
         row = results.iloc[0]
-        c1, c2, c3, c4, c5 = st.columns(5)
-        c1.metric("Prediction",         row['Prediction'])
-        c2.metric("Fusion Risk Score",  f"{row['Risk Score']:.2%}")
-        c3.metric("RNA Score",          f"{row['RNA Score']:.2%}"          if row['RNA Score']          is not None else "N/A")
-        c4.metric("Protein Score",      f"{row['Protein Score']:.2%}"      if row['Protein Score']      is not None else "N/A")
-        c5.metric("Metabolomics Score", f"{row['Metabolomics Score']:.2%}" if row['Metabolomics Score'] is not None else "N/A")
+        c1, c2, c3, c4, c5, c6, c7 = st.columns(7)
+        c1.metric("Binary Call",            row["Binary Call"])
+        c2.metric("Prediction",             row["Prediction"])
+        c3.metric("Raw Fusion Score",       f"{row['Risk Score (Raw)']:.4f}")
+        c4.metric("Calibrated Probability", f"{row['Risk Score (Calibrated)']:.4f}")
+        c5.metric("RNA Score",              _fmt(row["RNA Score"]))
+        c6.metric("Protein Score",          _fmt(row["Protein Score"]))
+        c7.metric("Metabolomics Score",     _fmt(row["Metabolomics Score"]))
+        st.caption(
+            f"**Threshold:** {THRESHOLD:.4f} (Youden, operates on raw score). "
+            "Calibrated probability reflects ~4.6% GBM prevalence in the external validation set — "
+            "a raw score of ~0.97 maps to ~0.40 calibrated. This is expected, not a bug. "
+            "Use raw score for the binary GBM/Non-GBM call."
+        )
+
     else:
         col1, col2 = st.columns(2)
         with col1:
-            fig = px.histogram(results, x="Risk Score", color="Prediction",
-                               title="Risk Probability Distribution",
+            fig = px.histogram(results, x="Risk Score (Raw)", color="Prediction",
+                               title="Raw Fusion Score Distribution",
                                color_discrete_map={"High Risk": "#EF553B", "Low Risk": "#00CC96"},
                                nbins=20)
-            fig.update_layout(xaxis_title="Risk Score", yaxis_title="Number of Patients")
+            fig.add_vline(x=THRESHOLD, line_dash="dash", line_color="gray",
+                          annotation_text=f"Youden ({THRESHOLD:.3f})")
+            fig.update_layout(xaxis_title="Raw Score", yaxis_title="Number of Patients")
             st.plotly_chart(fig, use_container_width=True, key=f"{key_prefix}_hist")
         with col2:
-            rs = results.sort_values('Risk Score', ascending=False).reset_index(drop=True)
-            rs['Patient_ID'] = rs.index
-            fig2 = px.bar(rs, x='Patient_ID', y='Risk Score', color='Prediction',
-                          title="Individual Patient Risk Scores",
+            rs = results.sort_values("Risk Score (Raw)", ascending=False).reset_index(drop=True)
+            rs["Patient_ID"] = rs.index
+            fig2 = px.bar(rs, x="Patient_ID", y="Risk Score (Raw)", color="Prediction",
+                          title="Individual Patient Raw Scores",
                           color_discrete_map={"High Risk": "#EF553B", "Low Risk": "#00CC96"})
-            fig2.add_hline(y=fusion_pkg['decision_threshold_default'], line_dash="dash",
-                           line_color="gray",
-                           annotation_text=f"Threshold ({fusion_pkg['decision_threshold_default']:.2f})")
+            fig2.add_hline(y=THRESHOLD, line_dash="dash", line_color="gray",
+                           annotation_text=f"Threshold ({THRESHOLD:.3f})")
             fig2.update_layout(yaxis_range=[0, 1])
             st.plotly_chart(fig2, use_container_width=True, key=f"{key_prefix}_bar")
 
         st.divider()
-        st.subheader("Risk Probability List")
-        display = results[['Prediction', 'Risk Score', 'RNA Score', 'Protein Score', 'Metabolomics Score']].copy()
-        display.insert(0, 'Patient ID', display.index)
-        for col in ['Risk Score', 'RNA Score', 'Protein Score', 'Metabolomics Score']:
-            display[col] = display[col].apply(lambda x: f"{x:.2%}" if pd.notna(x) and x is not None else "N/A")
+        st.subheader("Risk Score Table")
+        display = results[["Prediction", "Binary Call",
+                            "Risk Score (Raw)", "Risk Score (Calibrated)",
+                            "RNA Score", "Protein Score", "Metabolomics Score"]].copy()
+        display.insert(0, "Patient ID", display.index)
+        for col in ["Risk Score (Raw)", "Risk Score (Calibrated)",
+                    "RNA Score", "Protein Score", "Metabolomics Score"]:
+            display[col] = display[col].apply(
+                lambda x: f"{x:.4f}" if pd.notna(x) and x is not None else "N/A"
+            )
         st.dataframe(display, use_container_width=True, hide_index=True)
+        st.caption(
+            f"Threshold = {THRESHOLD:.4f} (Youden, raw score). "
+            "Calibrated score is isotonic-mapped to the external validation set (~4.6% GBM prevalence). "
+            "Use raw score for the binary call."
+        )
 
 
 def render_dashboard(results, mode="manual", key_prefix="", patient_labels=None):
@@ -275,31 +293,29 @@ def render_dashboard(results, mode="manual", key_prefix="", patient_labels=None)
         st.divider()
         st.subheader("Cohort Summary Statistics")
         c1, c2, c3, c4 = st.columns(4)
-        total     = len(results)
-        high_risk = (results['Prediction'] == 'High Risk').sum()
-        c1.metric("Total Patients",    total)
-        c2.metric("High Risk",         f"{high_risk} ({high_risk/total:.1%})")
-        c3.metric("Mean Risk Score",   f"{results['Risk Score'].mean():.2%}")
-        c4.metric("Median Risk Score", f"{results['Risk Score'].median():.2%}")
+        total = len(results)
+        gbm_n = (results["Binary Call"] == "GBM").sum()
+        c1.metric("Total Patients",  total)
+        c2.metric("GBM Calls",       f"{gbm_n} ({gbm_n/total:.1%})")
+        c3.metric("Mean Raw Score",  f"{results['Risk Score (Raw)'].mean():.4f}")
+        c4.metric("Median Raw Score",f"{results['Risk Score (Raw)'].median():.4f}")
 
     st.divider()
     st.subheader("Individual Patient Analysis")
-    fmt = (lambda i: f"Patient {i} — {patient_labels[i]}" if patient_labels and i < len(patient_labels)
-           else lambda i: f"Patient {i}")
-    if callable(fmt):
-        selected = st.selectbox("Select Patient Record", results.index,
-                                format_func=fmt, key=f"{key_prefix}_select")
-    else:
-        selected = st.selectbox("Select Patient Record", results.index, key=f"{key_prefix}_select")
-
+    fmt = (lambda i: f"Patient {i} — {patient_labels[i]}"
+           if patient_labels and i < len(patient_labels) else f"Patient {i}")
+    selected = st.selectbox("Select Patient Record", results.index,
+                            format_func=fmt, key=f"{key_prefix}_select")
     row = results.iloc[selected]
 
-    c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Prediction",         row['Prediction'])
-    c2.metric("Fusion Score",       f"{row['Risk Score']:.2%}")
-    c3.metric("RNA Score",          f"{row['RNA Score']:.2%}"          if pd.notna(row['RNA Score'])          else "N/A")
-    c4.metric("Protein Score",      f"{row['Protein Score']:.2%}"      if pd.notna(row['Protein Score'])      else "N/A")
-    c5.metric("Metabolomics Score", f"{row['Metabolomics Score']:.2%}" if pd.notna(row['Metabolomics Score']) else "N/A")
+    c1, c2, c3, c4, c5, c6, c7 = st.columns(7)
+    c1.metric("Binary Call",            row["Binary Call"])
+    c2.metric("Prediction",             row["Prediction"])
+    c3.metric("Raw Score",              f"{row['Risk Score (Raw)']:.4f}")
+    c4.metric("Calibrated",             f"{row['Risk Score (Calibrated)']:.4f}")
+    c5.metric("RNA Score",              _fmt(row["RNA Score"]))
+    c6.metric("Protein Score",          _fmt(row["Protein Score"]))
+    c7.metric("Metabolomics Score",     _fmt(row["Metabolomics Score"]))
 
     st.divider()
     col_l, col_r = st.columns([1, 2])
@@ -307,96 +323,96 @@ def render_dashboard(results, mode="manual", key_prefix="", patient_labels=None)
     with col_l:
         st.write("### Multi-Modal Signature")
         r_vals = [
-            row['Protein Score']      if pd.notna(row['Protein Score'])      else 0,
-            row['RNA Score']          if pd.notna(row['RNA Score'])          else 0,
-            row['Metabolomics Score'] if pd.notna(row['Metabolomics Score']) else 0,
+            row["Protein Score"]      if pd.notna(row["Protein Score"])      else 0,
+            row["RNA Score"]          if pd.notna(row["RNA Score"])          else 0,
+            row["Metabolomics Score"] if pd.notna(row["Metabolomics Score"]) else 0,
         ]
         fig_radar = go.Figure(data=go.Scatterpolar(
-            r=r_vals,
-            theta=['Proteins', 'RNA', 'Metabolites'],
-            fill='toself',
-            line_color='#5dade2'
+            r=r_vals, theta=["Proteins", "RNA", "Metabolites"],
+            fill="toself", line_color="#5dade2"
         ))
         fig_radar.update_layout(polar=dict(radialaxis=dict(range=[0, 1])), showlegend=False)
         st.plotly_chart(fig_radar, use_container_width=True, key=f"{key_prefix}_radar_{selected}")
 
     with col_r:
-        st.write(f"### Top 20 Marker Levels (Patient {selected})")
+        st.write(f"### Biomarker Input Values (Patient {selected})")
         marker_cols = [c for c in results.columns if c not in SCORE_COLS]
-        marker_vals = row[marker_cols].astype(float).dropna().sort_values(ascending=False).head(20)
-        fig_top = px.bar(x=marker_vals.values, y=marker_vals.index, orientation='h',
-                         color=marker_vals.values, color_continuous_scale='Viridis')
-        fig_top.update_layout(yaxis_title="Biomarker", xaxis_title="Value")
+        marker_vals = row[marker_cols].astype(float).dropna().sort_values(ascending=False)
+        fig_top = px.bar(x=marker_vals.values, y=marker_vals.index, orientation="h",
+                         color=marker_vals.values, color_continuous_scale="Viridis",
+                         labels={"x": "Raw Value", "y": "Biomarker"})
         st.plotly_chart(fig_top, use_container_width=True, key=f"{key_prefix}_pbar_{selected}")
 
     st.divider()
-    st.subheader(f"Biomarker Levels for Patient {selected}")
     col_imp1, col_imp2 = st.columns(2)
 
     with col_imp1:
-        st.write("#### Patient's Top 15 Expressed Markers")
-        marker_cols = [c for c in results.columns if c not in SCORE_COLS]
-        patient_top = row[marker_cols].astype(float).dropna().sort_values(ascending=False).head(15)
-        fig_pt = px.bar(x=patient_top.values, y=patient_top.index, orientation='h',
-                        color=patient_top.values, color_continuous_scale='Viridis',
-                        title=f"Highest Values — Patient {selected}")
-        fig_pt.update_layout(yaxis={'categoryorder': 'total ascending'})
+        st.write("#### Patient's Biomarker Values")
+        patient_vals = row[marker_cols].astype(float).dropna().sort_values(ascending=False)
+        fig_pt = px.bar(x=patient_vals.values, y=patient_vals.index, orientation="h",
+                        color=patient_vals.values, color_continuous_scale="Viridis",
+                        title=f"Input Values — Patient {selected}")
+        fig_pt.update_layout(yaxis={"categoryorder": "total ascending"})
         st.plotly_chart(fig_pt, use_container_width=True, key=f"{key_prefix}_ptop_{selected}")
 
     with col_imp2:
-        st.write("#### Global Model Importance (Top 15)")
-        fig_gi = px.bar(importance_df_display.head(15),
-                        x='Influence Score', y='Biomarker', color='Layer',
-                        orientation='h', title="Most Influential Markers Globally",
-                        color_discrete_map={'RNA': '#5dade2', 'Protein': '#e74c3c', 'Metabolomics': '#27ae60'})
-        fig_gi.update_layout(yaxis={'categoryorder': 'total ascending'})
+        st.write("#### Global XGBoost Importance")
+        fig_gi = px.bar(importance_df_display,
+                        x="Influence Score", y="Biomarker", color="Layer",
+                        orientation="h", title="Feature Importance by Layer",
+                        color_discrete_map={"RNA": "#5dade2", "Protein": "#e74c3c",
+                                            "Metabolomics": "#27ae60"})
+        fig_gi.update_layout(yaxis={"categoryorder": "total ascending"})
         st.plotly_chart(fig_gi, use_container_width=True, key=f"{key_prefix}_gimp_{selected}")
 
     with st.expander("View All Biomarker Values for This Patient"):
-        marker_cols = [c for c in results.columns if c not in SCORE_COLS]
-        all_markers = row[marker_cols].to_frame(name='Value').reset_index()
-        all_markers.columns = ['Biomarker', 'Value']
-        all_markers = all_markers.sort_values('Value', ascending=False)
+        all_markers = row[marker_cols].to_frame(name="Value").reset_index()
+        all_markers.columns = ["Biomarker", "Value"]
+        all_markers = all_markers.sort_values("Value", ascending=False)
         st.dataframe(all_markers, use_container_width=True, hide_index=True)
 
 
 # =============================================================================
-# REFERENCE TABLE HELPER
+# REFERENCE TABLE
 # =============================================================================
 def build_reference_table():
     rows = []
-    for pkg, layer in [(rna_pkg, 'RNA'), (prot_pkg, 'Protein'), (met_pkg, 'Metabolomics')]:
-        for feat, sym in zip(pkg['features'], pkg['feature_symbols']):
-            rr = pkg['reference_ranges'][feat]
+    layer_label = {"rna": "RNA", "prot": "Protein", "met": "Metabolomics"}
+    for layer_key, label in layer_label.items():
+        feats = PRUNED[layer_key]
+        means = ZSCORE_PARAMS[layer_key]["mean"]
+        stds  = ZSCORE_PARAMS[layer_key]["std"]
+        imps  = dict(zip(feats, SUB_MODELS[layer_key].feature_importances_))
+        for f in feats:
+            m = means.get(f, np.nan)
+            s = stds.get(f, np.nan)
             rows.append({
-                'Layer': layer,
-                'Feature ID': feat,
-                'Symbol': sym,
-                'GBM Mean': round(rr.get('gbm_mean', np.nan), 4),
-                'Healthy Mean': round(rr.get('healthy_mean', np.nan), 4),
-                'Min': round(rr['min'], 4),
-                'Max': round(rr['max'], 4),
+                "Layer":          label,
+                "Symbol":         f,
+                "ENSG":           SYMBOL_TO_ENSG.get(f, "—"),
+                "Training Mean":  round(m, 4) if not np.isnan(m) else "N/A",
+                "Training Std":   round(s, 4) if not np.isnan(s) else "N/A",
+                "XGB Importance": round(imps.get(f, 0.0), 4),
             })
     return pd.DataFrame(rows)
 
 
 # =============================================================================
-# DEMO DATA
+# DEMO DATA — built from real CPTAC GBM + GTEx normal training samples
+# 5 GBM tumor (C3L/C3N, all 3 layers) + 5 GTEx normal (RNA+Prot, no met)
 # =============================================================================
-DEMO_CSV_PATH = 'TGCA_DEMO_DATA.csv'
+DEMO_CSV_PATH = "MOmics_v11_demo_data.csv"
 
 @st.cache_data
 def load_demo_data():
     try:
         df = pd.read_csv(DEMO_CSV_PATH)
-        id_col = 'Sample ID' if 'Sample ID' in df.columns else 'Sample_ID'
-        sample_ids = df[id_col].tolist() if id_col in df.columns else [f"Patient {i}" for i in range(len(df))]
-        df_data = df.drop(columns=[id_col], errors='ignore')
-        # Remap symbols to IDs
-        df_data = df_data.rename(columns=lambda c: SYMBOL_TO_ID.get(c, c))
-        return df_data, sample_ids
+        sample_ids  = df["Sample_ID"].tolist()
+        true_labels = df["True_Label"].tolist() if "True_Label" in df.columns else ["Unknown"] * len(df)
+        df_data = df.drop(columns=["Sample_ID", "True_Label"], errors="ignore")
+        return df_data, sample_ids, true_labels
     except FileNotFoundError:
-        st.error(f"Demo data file '{DEMO_CSV_PATH}' not found.")
+        st.error(f"Demo data file '{DEMO_CSV_PATH}' not found. Ensure it is in the repo root.")
         st.stop()
 
 
@@ -407,13 +423,14 @@ st.sidebar.title("MOmics")
 st.sidebar.markdown("---")
 page = st.sidebar.radio("Navigation", ["Home", "Documentation", "User Analysis", "Demo Walkthrough"])
 
-# Model info in sidebar
 st.sidebar.markdown("---")
 st.sidebar.markdown("**Model Info**")
-st.sidebar.markdown(f"RNA features: {len(rna_pkg['features'])}")
-st.sidebar.markdown(f"Protein features: {len(prot_pkg['features'])}")
-st.sidebar.markdown(f"Metabolomics features: {len(met_pkg['features'])}")
-st.sidebar.markdown(f"Fusion threshold: {fusion_pkg['decision_threshold_default']:.3f}")
+st.sidebar.markdown(f"Version: {pipe.get('version', 'v11')}")
+st.sidebar.markdown(f"RNA features: {len(RNA_FEATURES)}")
+st.sidebar.markdown(f"Protein features: {len(PROT_FEATURES)}")
+st.sidebar.markdown(f"Metabolomics features: {len(MET_FEATURES)}")
+st.sidebar.markdown(f"Youden threshold: {THRESHOLD:.4f}")
+st.sidebar.markdown(f"Fusion AUROC: {DISCOVERY.get('fusion_auc', 0):.4f}")
 
 st.title("MOmics | GBM Clinical Diagnostic Suite")
 
@@ -424,7 +441,7 @@ st.title("MOmics | GBM Clinical Diagnostic Suite")
 if page == "Home":
     try:
         from PIL import Image
-        logo = Image.open('logo.png')
+        logo = Image.open("logo.png")
         st.image(logo, use_container_width=True)
     except Exception:
         st.info("Logo image not found. Please ensure 'logo.png' is in the root directory.")
@@ -432,12 +449,14 @@ if page == "Home":
     st.markdown("<h3 style='text-align: center;'>GBM Clinical Diagnostic Suite</h3>", unsafe_allow_html=True)
 
     st.divider()
-    st.subheader("Model Overview")
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("RNA Sub-model AUROC",          f"{rna_pkg.get('training_auroc', 0):.3f}")
-    col2.metric("Protein Sub-model AUROC",      f"{prot_pkg.get('training_auroc', 0):.3f}")
-    col3.metric("Metabolomics Sub-model AUROC", f"{met_pkg.get('training_auroc', 0):.3f}")
-    col4.metric("Fusion Model AUROC",           f"{fusion_pkg.get('training_auroc', 0):.3f}")
+    st.subheader("Discovery Cohort Performance")
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
+    c1.metric("RNA OOF AUROC",   f"{DISCOVERY.get('rna_oof_auc', 0):.4f}")
+    c2.metric("Prot OOF AUROC",  f"{DISCOVERY.get('prot_oof_auc', 0):.4f}")
+    c3.metric("Met OOF AUROC",   f"{DISCOVERY.get('met_oof_auc', 0):.4f}")
+    c4.metric("Fusion AUROC",    f"{DISCOVERY.get('fusion_auc', 0):.4f}")
+    c5.metric("Sensitivity",     f"{DISCOVERY.get('fusion_sens', 0):.1%}")
+    c6.metric("Specificity",     f"{DISCOVERY.get('fusion_spec', 0):.1%}")
 
 
 # =============================================================================
@@ -453,12 +472,16 @@ elif page == "Documentation":
     with doc_tabs[2]:
         st.markdown(MODEL_ARCH)
     with doc_tabs[3]:
-        st.subheader("Feature Reference Ranges")
-        st.write("GBM mean and healthy mean rank values used as defaults when a feature is not provided.")
+        st.subheader("Feature Reference")
+        st.write(
+            "All v11 panel features with frozen z-score parameters used during inference. "
+            "RNA inputs are log1p-transformed before z-scoring. "
+            "Features with NaN std were dropped during training and are filled with 0."
+        )
         ref_df = build_reference_table()
         layer_filter = st.selectbox("Filter by layer", ["All", "RNA", "Protein", "Metabolomics"])
         if layer_filter != "All":
-            ref_df = ref_df[ref_df['Layer'] == layer_filter]
+            ref_df = ref_df[ref_df["Layer"] == layer_filter]
         st.dataframe(ref_df, use_container_width=True, hide_index=True)
 
 
@@ -473,48 +496,54 @@ elif page == "User Analysis":
     with analysis_tabs[0]:
         st.subheader("Manual Patient Entry")
         st.info(
-            "Enter raw laboratory values for each biomarker. "
-            "Leave fields at 0.0 to use GBM reference mean for that feature. "
-            "You may omit entire layers — the fusion model handles missing layers natively."
+            "**RNA:** enter raw read counts (log1p applied internally). "
+            "**Protein & Metabolomics:** enter log2 abundances (CPTAC standard). "
+            "Do not pre-normalize. Leave a field at 0.0 to fill with training mean. "
+            "Uncheck a layer to exclude it — the fusion model handles missing layers natively."
         )
 
         user_inputs = {}
+        col_tog1, col_tog2, col_tog3 = st.columns(3)
+        rna_enabled  = col_tog1.checkbox("Include RNA layer",          value=True, key="tog_rna")
+        prot_enabled = col_tog2.checkbox("Include Protein layer",      value=True, key="tog_prot")
+        met_enabled  = col_tog3.checkbox("Include Metabolomics layer", value=True, key="tog_met")
 
-        st.write("#### RNA Biomarkers")
-        rna_cols = st.columns(4)
-        for i, (feat, sym) in enumerate(zip(rna_pkg['features'], rna_pkg['feature_symbols'])):
-            with rna_cols[i % 4]:
+        st.write("#### RNA Biomarkers (raw read counts)")
+        rna_cols = st.columns(3)
+        for i, feat in enumerate(RNA_FEATURES):
+            with rna_cols[i % 3]:
                 user_inputs[feat] = st.number_input(
-                    sym, value=0.0, key=f"rna_{feat}",
-                    help=f"Feature ID: {feat}"
+                    feat, value=0.0, key=f"rna_{feat}",
+                    help=f"ENSG: {SYMBOL_TO_ENSG.get(feat, '—')}",
+                    disabled=not rna_enabled
                 )
 
-        st.write("#### Protein Biomarkers")
-        prot_cols = st.columns(3)
-        for i, (feat, sym) in enumerate(zip(prot_pkg['features'], prot_pkg['feature_symbols'])):
-            with prot_cols[i % 3]:
+        st.write("#### Protein Biomarkers (log2 abundance)")
+        prot_cols = st.columns(4)
+        for i, feat in enumerate(PROT_FEATURES):
+            with prot_cols[i % 4]:
                 user_inputs[feat] = st.number_input(
-                    sym, value=0.0, key=f"prot_{feat}",
-                    help=f"Feature ID: {feat}"
+                    feat, value=0.0, key=f"prot_{feat}",
+                    help=f"ENSG: {SYMBOL_TO_ENSG.get(feat, '—')}",
+                    disabled=not prot_enabled
                 )
 
-        st.write("#### Metabolomics Biomarkers")
-        met_cols = st.columns(4)
-        for i, (feat, sym) in enumerate(zip(met_pkg['features'], met_pkg['feature_symbols'])):
-            with met_cols[i % 4]:
+        st.write("#### Metabolomics Biomarkers (log2 abundance)")
+        met_cols = st.columns(3)
+        for i, feat in enumerate(MET_FEATURES):
+            with met_cols[i % 3]:
                 user_inputs[feat] = st.number_input(
-                    sym, value=0.0, key=f"met_{feat}",
-                    help=f"Metabolite: {feat}"
+                    feat, value=0.0, key=f"met_{feat}",
+                    disabled=not met_enabled
                 )
 
         if st.button("Analyze Single Patient", key="btn_manual", type="primary"):
-            rna_d  = {f: user_inputs[f] for f in rna_pkg['features']}
-            prot_d = {f: user_inputs[f] for f in prot_pkg['features']}
-            met_d  = {f: user_inputs[f] for f in met_pkg['features']}
-            result = predict_patient(rna_d, prot_d, met_d)
-            # Add feature values for display
+            rna_d  = {f: user_inputs[f] for f in RNA_FEATURES}  if rna_enabled  else None
+            prot_d = {f: user_inputs[f] for f in PROT_FEATURES} if prot_enabled else None
+            met_d  = {f: user_inputs[f] for f in MET_FEATURES}  if met_enabled  else None
+            result = score_sample(rna_d, prot_d, met_d)
             for f in ALL_FEATURES:
-                result[to_symbol(f)] = user_inputs.get(f, np.nan)
+                result[f] = user_inputs.get(f, np.nan)
             m_results = pd.DataFrame([result])
             st.success("Analysis Complete!")
             st.divider()
@@ -526,50 +555,50 @@ elif page == "User Analysis":
         col_t1, col_t2 = st.columns([2, 1])
         with col_t2:
             st.write("### Download Template")
-            template_csv = pd.DataFrame(columns=ALL_SYMBOLS).to_csv(index=False).encode('utf-8')
+            layer_note = {f: ("raw counts" if f in RNA_FEATURES else "log2 abundance") for f in ALL_FEATURES}
+            template_csv = pd.DataFrame([layer_note]).to_csv(index=False).encode("utf-8")
             st.download_button(
                 label="Download CSV Template",
                 data=template_csv,
-                file_name="MOmics_Patient_Template.csv",
+                file_name="MOmics_v11_Patient_Template.csv",
                 mime="text/csv",
-                help="Fill in raw biomarker values. Columns are gene symbols."
+                help="Row 1 shows expected value type. Replace it with patient data before uploading."
             )
         with col_t1:
             st.write("### Upload Patient Data")
             uploaded_file = st.file_uploader(
-                "Upload filled MOmics CSV Template", type="csv",
-                help="CSV with gene symbol or feature ID column headers"
+                "Upload patient CSV", type="csv",
+                help="Columns = gene symbols. RNA = raw counts, Prot/Met = log2 abundance."
             )
 
         if uploaded_file is not None:
             try:
                 raw_df = pd.read_csv(uploaded_file)
+                raw_df = raw_df.drop(
+                    columns=[c for c in raw_df.columns if c in ("Sample ID", "Sample_ID")],
+                    errors="ignore"
+                )
                 st.success(f"File uploaded — {len(raw_df)} patient(s) found.")
-
-                # Drop sample ID columns if present
-                raw_df = raw_df.drop(columns=[c for c in raw_df.columns
-                                               if c in ('Sample ID', 'Sample_ID')], errors='ignore')
-
                 b_results = process_dataframe(raw_df)
                 st.divider()
                 st.subheader("Analysis Results")
                 render_dashboard(b_results, mode="bulk", key_prefix="blk")
             except Exception as e:
                 st.error(f"Error processing file: {e}")
-                st.info("Ensure your CSV uses gene symbol or Ensembl ID column headers.")
+                st.info("Ensure columns match feature symbols in the template.")
 
     # ── EXAMPLE ANALYSIS ──────────────────────────────────────────────────────
     with analysis_tabs[2]:
         st.subheader("Example Analysis")
         st.write(
-            "This tab runs a real analysis on a CPTAC GBM patient sample. "
-            "Click **Run Example Analysis** to see the full results dashboard."
+            "Runs the full v11 inference pipeline on a pre-loaded CPTAC GBM patient sample. "
+            "Input file (`momics_input.csv`) should have columns matching the v11 feature symbols."
         )
         col_ex1, col_ex2 = st.columns([1, 2])
         with col_ex1:
             st.markdown("**Input file:** `momics_input.csv`")
             st.markdown("**Sample:** CPTAC-3 GBM patient")
-            st.markdown("**Format:** Raw expression / abundance values")
+            st.markdown("**RNA:** raw read counts | **Prot/Met:** log2 abundance")
 
             if st.button("Run Example Analysis", type="primary", key="btn_example"):
                 try:
@@ -588,18 +617,13 @@ elif page == "User Analysis":
                     st.rerun()
 
         with col_ex2:
-            with st.expander("Preview: feature reference ranges"):
-                ref_df = build_reference_table()
-                st.dataframe(ref_df, use_container_width=True, hide_index=True)
+            with st.expander("v11 feature panel"):
+                st.dataframe(build_reference_table(), use_container_width=True, hide_index=True)
 
         if st.session_state.get("example_ran") and "example_results" in st.session_state:
             st.divider()
             st.subheader("Example Results")
-            render_dashboard(
-                st.session_state.example_results,
-                mode="bulk",
-                key_prefix="ex"
-            )
+            render_dashboard(st.session_state.example_results, mode="bulk", key_prefix="ex")
 
 
 # =============================================================================
@@ -610,18 +634,19 @@ elif page == "Demo Walkthrough":
     st.markdown("""
     <div class="demo-box">
     <h3>Welcome to the Demo Workspace</h3>
-    <p>This workspace uses <strong>real GBM patient data</strong> from the CPTAC dataset.
-    Explore the full analysis workflow with genuine patient biomarker profiles.</p>
+    <p>This workspace uses real samples from the v11 training cohort — the same data the model was built on.</p>
     <ul>
-        <li>Real CPTAC GBM patients</li>
-        <li>RNA, Protein, and Metabolomics layers</li>
-        <li>Full 3-layer → fusion pipeline</li>
-        <li>Interactive per-patient biomarker visualizations</li>
+        <li><strong>5 GBM tumor samples</strong> (CPTAC-3 cohort, C3L/C3N IDs) — all 3 layers available</li>
+        <li><strong>5 GTEx normal brain samples</strong> (PT- IDs) — RNA + Protein only (no metabolomics)</li>
+        <li>Full z-score → sub-model → fusion → isotonic calibration pipeline</li>
+        <li>Raw score (for binary call) and calibrated probability (for clinical context) both shown</li>
     </ul>
     </div>
     """, unsafe_allow_html=True)
 
-    demo_data, demo_sample_ids = load_demo_data()
+    demo_data, demo_sample_ids, demo_true_labels = load_demo_data()
+    # Build display labels: "C3L-00365 (GBM)" etc.
+    demo_labels = [f"{sid} ({lbl})" for sid, lbl in zip(demo_sample_ids, demo_true_labels)]
     st.divider()
 
     demo_mode = st.radio(
@@ -635,112 +660,134 @@ elif page == "Demo Walkthrough":
         st.subheader("Interactive Analysis with Sample Data")
         st.markdown("""<div class="demo-box demo-success">
         <h4>Real Patient Dataset Loaded</h4>
-        <p>Click "Analyze Sample Patients" to run the full 3-layer diagnostic pipeline.</p>
+        <p><strong>5 GBM tumor samples</strong> (CPTAC-3, all 3 layers) and
+        <strong>5 GTEx normal brain samples</strong> (RNA + Protein only, no metabolomics).
+        Click "Analyze Sample Patients" to run the full v11 diagnostic pipeline.</p>
         </div>""", unsafe_allow_html=True)
 
         with st.expander("Preview Sample Patient Data"):
-            preview_cols = [c for c in demo_data.columns if c in rna_pkg['features']][:8]
-            if not preview_cols:
-                preview_cols = demo_data.columns[:8].tolist()
-            st.dataframe(demo_data[preview_cols], use_container_width=True)
+            preview_df = demo_data.copy()
+            preview_df.insert(0, "Sample", demo_sample_ids)
+            preview_df.insert(1, "True Label", demo_true_labels)
+            st.dataframe(preview_df, use_container_width=True, hide_index=True)
 
         if st.button("Analyze Sample Patients", key="analyze_demo_patients", type="primary"):
-            with st.spinner("Analyzing biomarkers..."):
+            with st.spinner("Running v11 inference pipeline..."):
                 st.session_state.demo_try_results = process_dataframe(demo_data)
 
-        if 'demo_try_results' in st.session_state:
+        if "demo_try_results" in st.session_state:
             st.markdown("---")
             st.success("Analysis Complete!")
-            render_dashboard(
-                st.session_state.demo_try_results,
-                mode="bulk",
-                key_prefix="demo",
-                patient_labels=demo_sample_ids
+            # Show concordance with true labels
+            res = st.session_state.demo_try_results
+            concordant = sum(
+                (tl == "GBM") == (bc == "GBM")
+                for tl, bc in zip(demo_true_labels, res["Binary Call"].tolist())
             )
+            st.info(f"Model concordance with true labels: **{concordant}/{len(demo_true_labels)}** correct")
+            render_dashboard(res, mode="bulk", key_prefix="demo", patient_labels=demo_labels)
 
     # ── GUIDED TUTORIAL ───────────────────────────────────────────────────────
     elif demo_mode == "Guided Tutorial":
         st.subheader("Step-by-Step Guided Tutorial")
-        if 'tutorial_step' not in st.session_state:
+        if "tutorial_step" not in st.session_state:
             st.session_state.tutorial_step = 0
 
         st.progress(st.session_state.tutorial_step / 4)
         st.write(f"**Progress:** Step {st.session_state.tutorial_step + 1} of 5")
 
         if st.session_state.tutorial_step == 0:
-            st.markdown("""<div class="demo-box"><h3>Step 1: Understanding the Sample Data</h3>
-            <p>Let's look at the pre-loaded CPTAC GBM patient data and the three omics layers.</p></div>""",
-                        unsafe_allow_html=True)
-            ref_df = build_reference_table()
-            st.write("**Model feature layers:**")
-            st.dataframe(ref_df[['Layer', 'Symbol', 'GBM Mean', 'Healthy Mean']],
-                         use_container_width=True, hide_index=True)
+            st.markdown("""<div class="demo-box"><h3>Step 1: The Demo Dataset</h3>
+            <p>This demo uses real CPTAC-3 GBM tumor samples and GTEx normal brain samples —
+            the same data used to train the v11 model. 5 GBM + 5 Normal, with a mix of complete
+            (all 3 layers) and partial (RNA + Protein only) inputs.</p></div>""", unsafe_allow_html=True)
+            preview_df = demo_data.copy()
+            preview_df.insert(0, "Sample", demo_sample_ids)
+            preview_df.insert(1, "True Label", demo_true_labels)
+            st.dataframe(preview_df, use_container_width=True, hide_index=True)
+            st.caption("NaN = metabolomics layer not available for GTEx normals. XGBoost fusion handles this natively.")
             if st.button("Next: Run Analysis", key="tutorial_next_0"):
                 st.session_state.tutorial_step = 1
                 st.rerun()
 
         elif st.session_state.tutorial_step == 1:
-            st.markdown("""<div class="demo-box"><h3>Step 2: Running the Analysis</h3>
-            <p>Process the sample patients through the 3-layer fusion pipeline.</p></div>""",
+            st.markdown("""<div class="demo-box"><h3>Step 2: The Inference Pipeline</h3>
+            <p>Inputs are z-scored with frozen training parameters → scored by per-layer XGBoost sub-models
+            → fused by a meta-XGBoost → optionally calibrated by isotonic regression.
+            Missing layers (metabolomics for GTEx) pass NaN to fusion — not imputed.</p></div>""",
                         unsafe_allow_html=True)
             if st.button("Process Sample Data", key="tutorial_analyze", type="primary"):
-                with st.spinner("Analyzing..."):
+                with st.spinner("Running inference..."):
                     st.session_state.demo_results = process_dataframe(demo_data)
                     st.session_state.tutorial_step = 2
                 st.rerun()
 
         elif st.session_state.tutorial_step == 2:
-            st.markdown("""<div class="demo-box demo-success"><h3>Step 3: Cohort Results</h3></div>""",
-                        unsafe_allow_html=True)
-            if 'demo_results' in st.session_state:
-                render_risk_charts(st.session_state.demo_results, mode="bulk", key_prefix="tutorial")
+            st.markdown(
+                f"""<div class="demo-box demo-success"><h3>Step 3: Cohort Results</h3>
+                <p>Raw scores cluster bimodally: GBM ~0.97, Non-GBM ~0.38.
+                Youden threshold = {THRESHOLD:.4f}. GTEx normals correctly score Non-GBM
+                even without a metabolomics layer.</p></div>""",
+                unsafe_allow_html=True)
+            if "demo_results" in st.session_state:
+                res = st.session_state.demo_results
+                concordant = sum(
+                    (tl == "GBM") == (bc == "GBM")
+                    for tl, bc in zip(demo_true_labels, res["Binary Call"].tolist())
+                )
+                st.info(f"Concordance with true labels: **{concordant}/{len(demo_true_labels)}**")
+                render_risk_charts(res, mode="bulk", key_prefix="tutorial")
             if st.button("Next: Individual Patient", key="tutorial_next_2"):
                 st.session_state.tutorial_step = 3
                 st.rerun()
 
         elif st.session_state.tutorial_step == 3:
-            st.markdown("""<div class="demo-box"><h3>Step 4: Individual Patient</h3></div>""",
-                        unsafe_allow_html=True)
-            if 'demo_results' in st.session_state:
-                sel = st.selectbox("Choose patient:", range(len(demo_sample_ids)),
-                                   format_func=lambda i: f"Patient {i} — {demo_sample_ids[i]}",
+            st.markdown("""<div class="demo-box"><h3>Step 4: Individual Sample</h3>
+            <p>Compare a GBM and a Normal sample side-by-side to see how the biomarker
+            profiles differ across the panel.</p></div>""", unsafe_allow_html=True)
+            if "demo_results" in st.session_state:
+                sel = st.selectbox("Choose sample:", range(len(demo_labels)),
+                                   format_func=lambda i: demo_labels[i],
                                    key="tutorial_patient_select")
                 row = st.session_state.demo_results.iloc[sel]
-                c1, c2, c3, c4, c5 = st.columns(5)
-                c1.metric("Prediction",    row['Prediction'])
-                c2.metric("Fusion Score",  f"{row['Risk Score']:.1%}")
-                c3.metric("RNA",           f"{row['RNA Score']:.1%}"          if pd.notna(row['RNA Score'])          else "N/A")
-                c4.metric("Protein",       f"{row['Protein Score']:.1%}"      if pd.notna(row['Protein Score'])      else "N/A")
-                c5.metric("Metabolomics",  f"{row['Metabolomics Score']:.1%}" if pd.notna(row['Metabolomics Score']) else "N/A")
+                c1, c2, c3, c4, c5, c6, c7 = st.columns(7)
+                c1.metric("True Label",  demo_true_labels[sel])
+                c2.metric("Model Call",  row["Binary Call"])
+                c3.metric("Raw",         f"{row['Risk Score (Raw)']:.4f}")
+                c4.metric("Calibrated",  f"{row['Risk Score (Calibrated)']:.4f}")
+                c5.metric("RNA",         _fmt(row["RNA Score"]))
+                c6.metric("Protein",     _fmt(row["Protein Score"]))
+                c7.metric("Met",         _fmt(row["Metabolomics Score"]))
 
                 marker_cols = [c for c in st.session_state.demo_results.columns if c not in SCORE_COLS]
-                top10 = row[marker_cols].astype(float).dropna().sort_values(ascending=False).head(10)
-                fig = px.bar(x=top10.values, y=top10.index, orientation='h',
-                             title=f"Top 10 Biomarkers — Patient {sel}")
+                vals = row[marker_cols].astype(float).dropna().sort_values(ascending=False)
+                fig = px.bar(x=vals.values, y=vals.index, orientation="h",
+                             title=f"Biomarker Values — {demo_labels[sel]}")
                 st.plotly_chart(fig, use_container_width=True)
-
             if st.button("Next: Wrap Up", key="tutorial_next_3"):
                 st.session_state.tutorial_step = 4
                 st.rerun()
 
         elif st.session_state.tutorial_step == 4:
             st.markdown("""<div class="demo-box demo-success"><h3>Tutorial Complete!</h3>
-            <p>You've learned the full MOmics workflow: data layers, pipeline, cohort results, and individual analysis.</p>
+            <p>You've walked through the full v11 pipeline: z-score normalization → sub-models →
+            fusion → Youden threshold → isotonic calibration, on real CPTAC GBM and GTEx normal samples.</p>
             </div>""", unsafe_allow_html=True)
             c1, c2 = st.columns(2)
             with c1:
-                st.info("Navigate to 'User Analysis' to work with your own data")
+                st.info("Navigate to 'User Analysis' to score your own samples.")
             with c2:
                 if st.button("🔄 Restart Tutorial", key="restart_tut"):
                     st.session_state.tutorial_step = 0
-                    st.session_state.pop('demo_results', None)
+                    st.session_state.pop("demo_results", None)
                     st.rerun()
 
     # ── LEARN BY EXPLORING ────────────────────────────────────────────────────
     elif demo_mode == "Learn by Exploring":
         st.subheader("Free Exploration Mode")
         st.markdown("""<div class="demo-box"><h4>Explore at Your Own Pace</h4>
-        <p>Full interface with real CPTAC GBM data.</p></div>""", unsafe_allow_html=True)
+        <p>Full interface with real CPTAC GBM tumor + GTEx normal brain samples and the v11 pipeline.</p>
+        </div>""", unsafe_allow_html=True)
 
         exp_tabs = st.tabs(["Sample Analysis", "Learning Resources", "Tips & Tricks"])
 
@@ -748,48 +795,57 @@ elif page == "Demo Walkthrough":
             if st.button("Load & Analyze Sample Data", key="explore_analyze", type="primary"):
                 with st.spinner("Analyzing..."):
                     st.session_state.demo_explore_results = process_dataframe(demo_data)
-            if 'demo_explore_results' in st.session_state:
+            if "demo_explore_results" in st.session_state:
                 st.success("Sample data analyzed!")
-                st.divider()
-                render_dashboard(
-                    st.session_state.demo_explore_results,
-                    mode="bulk",
-                    key_prefix="explore",
-                    patient_labels=demo_sample_ids
+                res = st.session_state.demo_explore_results
+                concordant = sum(
+                    (tl == "GBM") == (bc == "GBM")
+                    for tl, bc in zip(demo_true_labels, res["Binary Call"].tolist())
                 )
+                st.info(f"Concordance with true labels: **{concordant}/{len(demo_true_labels)}**")
+                st.divider()
+                render_dashboard(res, mode="bulk", key_prefix="explore", patient_labels=demo_labels)
 
         with exp_tabs[1]:
             st.write("### Quick Reference")
-            with st.expander("Understanding Risk Scores"):
-                st.write("- **0–30%**: Very Low Risk\n- **30–50%**: Low Risk\n- **50–70%**: Moderate-High Risk\n- **70–100%**: Very High Risk")
-            with st.expander("Omics Layers"):
+            with st.expander("Understanding the Two Scores"):
                 st.write(
-                    f"- **RNA ({len(rna_pkg['features'])} features):** Gene expression from RNA-seq. "
-                    f"AUROC = {rna_pkg.get('training_auroc', 0):.3f}\n"
-                    f"- **Protein ({len(prot_pkg['features'])} features):** Protein abundance from mass spectrometry. "
-                    f"AUROC = {prot_pkg.get('training_auroc', 0):.3f}\n"
-                    f"- **Metabolomics ({len(met_pkg['features'])} features):** Metabolite concentrations. "
-                    f"AUROC = {met_pkg.get('training_auroc', 0):.3f}\n"
-                    f"- **Fusion AUROC = {fusion_pkg.get('training_auroc', 0):.3f}**"
+                    f"- **Raw fusion score**: XGBoost output. Threshold = {THRESHOLD:.4f} (Youden). "
+                    "Scores cluster near 0.38 (Non-GBM) or 0.97 (GBM).\n"
+                    "- **Calibrated probability**: isotonic-mapped to external validation prevalence "
+                    "(4.6% GBM). A raw score of ~0.97 → ~0.40 calibrated. This is expected, not a bug. "
+                    "In a higher-prevalence clinical setting the posterior would be higher."
                 )
-            with st.expander("Input Format"):
+            with st.expander("Input Format by Layer"):
                 st.write(
-                    "The model expects **raw values** (counts, abundance, concentration). "
-                    "The app automatically applies within-sample rank normalization before scoring. "
-                    "Missing layers are handled natively — XGBoost treats them as NaN in the fusion step."
+                    f"- **RNA ({len(RNA_FEATURES)} features):** {', '.join(RNA_FEATURES)} — "
+                    "**raw read counts**. log1p applied internally before z-scoring.\n"
+                    f"- **Protein ({len(PROT_FEATURES)} features):** {', '.join(PROT_FEATURES)} — "
+                    "**log2 abundance** (CPTAC reference-intensity normalized).\n"
+                    f"- **Metabolomics ({len(MET_FEATURES)} features):** {', '.join(MET_FEATURES)} — "
+                    "**log2 abundance**.\n\n"
+                    "Do not pre-normalize inputs — z-scoring uses frozen training parameters."
+                )
+            with st.expander("Missing Layers"):
+                st.write(
+                    "Uncheck a layer in Manual Entry or simply omit its columns from a CSV. "
+                    "The fusion model handles NaN sub-model probabilities natively via XGBoost's "
+                    "missing-value mechanism — do not impute or average. "
+                    "The GTEx normal samples in this demo have no metabolomics and still score correctly."
                 )
 
         with exp_tabs[2]:
             st.write("### Exploration Tips")
             st.info(
                 "**Things to Try:**\n"
-                "1. Compare Low Risk vs High Risk patient radar charts — look for layer-level differences\n"
-                "2. Check whether RNA, Protein, or Metabolomics score drives the fusion risk score\n"
-                "3. Download the CSV template and try uploading your own data in Bulk Upload"
+                "1. Compare a GBM sample (C3L/C3N) vs a Normal (PT-) in the individual patient selector\n"
+                "2. Notice how Normal samples score ~0.38 raw even with only 2 layers available\n"
+                "3. Compare raw vs calibrated scores — the gap reflects 4.6% GBM prevalence in the external set\n"
+                "4. Check the Feature Reference tab in Documentation for training z-score parameters"
             )
 
     st.divider()
     if st.button("Reset Demo Workspace"):
-        for key in [k for k in st.session_state if 'demo' in k or 'tutorial' in k]:
+        for key in [k for k in st.session_state if "demo" in k or "tutorial" in k]:
             del st.session_state[key]
         st.rerun()
