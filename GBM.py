@@ -425,12 +425,12 @@ page = st.sidebar.radio("Navigation", ["Home", "Documentation", "User Analysis",
 
 st.sidebar.markdown("---")
 st.sidebar.markdown("**Model Info**")
-st.sidebar.markdown(f"Version: {pipe.get('version', 'v11')}")
+st.sidebar.markdown(f"")
 st.sidebar.markdown(f"RNA features: {len(RNA_FEATURES)}")
 st.sidebar.markdown(f"Protein features: {len(PROT_FEATURES)}")
 st.sidebar.markdown(f"Metabolomics features: {len(MET_FEATURES)}")
-st.sidebar.markdown(f"Youden threshold: {THRESHOLD:.4f}")
-st.sidebar.markdown(f"Fusion AUROC: {DISCOVERY.get('fusion_auc', 0):.4f}")
+st.sidebar.markdown(f"")
+st.sidebar.markdown(f"")
 
 st.title("MOmics | GBM Clinical Diagnostic Suite")
 
