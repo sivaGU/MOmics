@@ -151,7 +151,10 @@ def _prepare_layer(layer_key, user_dict):
 
 
 def score_sample(rna_dict, prot_dict, met_dict):
-    """3-layer z-score → sub-models → fusion → isotonic calibration."""
+    """3-layer z-score → sub-models → fusion → isotonic calibration.
+    None dict = layer not provided → NaN passed to fusion (XGBoost handles natively).
+    Dict with some/all None values = layer provided, blanks filled with training mean (z=0).
+    """
     layer_probs  = []
     layer_scores = {}
     for layer_key, user_dict, label in [
@@ -159,11 +162,12 @@ def score_sample(rna_dict, prot_dict, met_dict):
         ("prot", prot_dict, "Protein Score"),
         ("met",  met_dict,  "Metabolomics Score"),
     ]:
-        arr = _prepare_layer(layer_key, user_dict)
-        if arr is None:
+        # Treat a dict where every value is None as a missing layer
+        if user_dict is None or all(v is None for v in user_dict.values()):
             layer_probs.append(np.nan)
             layer_scores[label] = None
         else:
+            arr = _prepare_layer(layer_key, user_dict)
             p = float(SUB_MODELS[layer_key].predict_proba(arr)[:, 1][0])
             layer_probs.append(p)
             layer_scores[label] = p
@@ -553,41 +557,50 @@ elif page == "User Analysis":
         met_enabled  = col_tog3.checkbox("Include Metabolomics layer", value=True, key="tog_met")
 
         st.write("#### RNA Biomarkers (raw read counts)")
+        st.caption("Leave blank (None) to fill with training mean. Enter 0 only if the gene genuinely has zero counts.")
         rna_cols = st.columns(3)
         for i, feat in enumerate(RNA_FEATURES):
             with rna_cols[i % 3]:
                 user_inputs[feat] = st.number_input(
-                    feat, value=0.0, key=f"rna_{feat}",
-                    help=f"ENSG: {SYMBOL_TO_ENSG.get(feat, '—')}",
+                    feat, value=None, placeholder="leave blank = training mean",
+                    key=f"rna_{feat}",
+                    help=f"ENSG: {SYMBOL_TO_ENSG.get(feat, '—')}. Raw read count.",
                     disabled=not rna_enabled
                 )
 
-        st.write("#### Protein Biomarkers")
+        st.write("#### Protein Biomarkers (log2 abundance)")
+        st.caption("Leave blank (None) to fill with training mean.")
         prot_cols = st.columns(4)
         for i, feat in enumerate(PROT_FEATURES):
             with prot_cols[i % 4]:
                 user_inputs[feat] = st.number_input(
-                    feat, value=0.0, key=f"prot_{feat}",
-                    help=f"ENSG: {SYMBOL_TO_ENSG.get(feat, '—')}",
+                    feat, value=None, placeholder="leave blank = training mean",
+                    key=f"prot_{feat}",
+                    help=f"ENSG: {SYMBOL_TO_ENSG.get(feat, '—')}. Log2 CPTAC abundance.",
                     disabled=not prot_enabled
                 )
 
-        st.write("#### Metabolomics Biomarkers")
+        st.write("#### Metabolomics Biomarkers (log2 abundance)")
+        st.caption("Leave blank (None) to fill with training mean.")
         met_cols = st.columns(3)
         for i, feat in enumerate(MET_FEATURES):
             with met_cols[i % 3]:
                 user_inputs[feat] = st.number_input(
-                    feat, value=0.0, key=f"met_{feat}",
+                    feat, value=None, placeholder="leave blank = training mean",
+                    key=f"met_{feat}",
                     disabled=not met_enabled
                 )
 
         if st.button("Analyze Single Patient", key="btn_manual", type="primary"):
+            # None = user left blank → _prepare_layer fills with training mean (z=0)
+            # Only pass a layer dict if the layer is enabled; otherwise pass None
+            # so the fusion model handles it natively via XGBoost missing-value handling
             rna_d  = {f: user_inputs[f] for f in RNA_FEATURES}  if rna_enabled  else None
             prot_d = {f: user_inputs[f] for f in PROT_FEATURES} if prot_enabled else None
             met_d  = {f: user_inputs[f] for f in MET_FEATURES}  if met_enabled  else None
             result = score_sample(rna_d, prot_d, met_d)
             for f in ALL_FEATURES:
-                result[f] = user_inputs.get(f, np.nan)
+                result[f] = user_inputs.get(f)  # preserves None for display
             m_results = pd.DataFrame([result])
             st.success("Analysis Complete!")
             st.divider()
