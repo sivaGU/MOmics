@@ -4,7 +4,11 @@ import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
 import joblib
+from pathlib import Path
 from docs import OVERVIEW, GUI_GUIDE, MODEL_ARCH
+
+# Resolve all asset paths relative to this script
+_HERE = Path(__file__).parent
 
 # --- Page Configuration ---
 st.set_page_config(page_title="MOmics", layout="wide", page_icon="🧬")
@@ -77,24 +81,23 @@ st.markdown("""
 # =============================================================================
 @st.cache_resource
 def load_pipeline():
-    return joblib.load("MOmics_v11_locked_pipeline.pkl")
+    return joblib.load(_HERE / "MOmics_v11_locked_pipeline.pkl")
 
 pipe = load_pipeline()
 
-# Unpack everything we need from the single artifact
-PRUNED         = pipe["pruned_features"]       # {'rna': [...], 'prot': [...], 'met': [...]}
-SUB_MODELS     = pipe["sub_models"]            # {'rna': XGB, 'prot': XGB, 'met': XGB}
-FUSION_MODEL   = pipe["fusion_model"]          # XGBClassifier
-ZSCORE_PARAMS  = pipe["zscore_params"]         # {'rna': {'mean': {f: μ}, 'std': {f: σ}}, ...}
-THRESHOLD      = pipe["youden_threshold"]      # 0.9641
-RNA_LOG1P      = pipe["rna_log1p_required"]    # True
-CALIBRATOR     = pipe["isotonic_calibrator"]   # IsotonicRegression
+PRUNED         = pipe["pruned_features"]
+SUB_MODELS     = pipe["sub_models"]
+FUSION_MODEL   = pipe["fusion_model"]
+ZSCORE_PARAMS  = pipe["zscore_params"]
+THRESHOLD      = pipe["youden_threshold"]
+RNA_LOG1P      = pipe["rna_log1p_required"]
+CALIBRATOR     = pipe["isotonic_calibrator"]
 DISCOVERY      = pipe["discovery_metrics"]
 SYMBOL_TO_ENSG = pipe["symbol_to_ensg"]
 
-RNA_FEATURES  = PRUNED["rna"]   # ['BSN', 'PCLO', 'PRKCE', 'PTPRT', 'CIT', 'MAPT']
-PROT_FEATURES = PRUNED["prot"]  # ['PTPRT', 'CIT', 'PCLO', 'BSN']
-MET_FEATURES  = PRUNED["met"]   # ['hypotaurine', 'creatinine', 'citricacid']
+RNA_FEATURES  = PRUNED["rna"]
+PROT_FEATURES = PRUNED["prot"]
+MET_FEATURES  = PRUNED["met"]
 ALL_FEATURES  = RNA_FEATURES + PROT_FEATURES + MET_FEATURES
 
 SCORE_COLS = ["Prediction", "Risk Score (Raw)", "Risk Score (Calibrated)",
@@ -130,18 +133,12 @@ def _zscore(value, mean, std):
 
 
 def _prepare_layer(layer_key, user_dict):
-    """
-    Z-score normalize a layer's input dict.
-    RNA: log1p applied first. Missing features within a provided layer filled with 0 (z-score mean).
-    Returns (1, n_features) array, or None if user_dict is None.
-    """
+    """Z-score a layer dict. RNA gets log1p first. Returns (1, n) array or None."""
     if user_dict is None:
         return None
-
     features = PRUNED[layer_key]
     means    = ZSCORE_PARAMS[layer_key]["mean"]
     stds     = ZSCORE_PARAMS[layer_key]["std"]
-
     row = []
     for f in features:
         raw = user_dict.get(f, None)
@@ -150,19 +147,13 @@ def _prepare_layer(layer_key, user_dict):
         else:
             val = np.log1p(float(raw)) if (layer_key == "rna" and RNA_LOG1P) else float(raw)
             row.append(_zscore(val, means.get(f), stds.get(f)))
-
     return np.array(row, dtype=float).reshape(1, -1)
 
 
 def score_sample(rna_dict, prot_dict, met_dict):
-    """
-    Full inference: z-score → 3 sub-models → fusion → calibration.
-    Each dict is {symbol: raw_value} or None if layer unavailable.
-    Binary call uses raw probability vs Youden threshold.
-    """
+    """3-layer z-score → sub-models → fusion → isotonic calibration."""
     layer_probs  = []
     layer_scores = {}
-
     for layer_key, user_dict, label in [
         ("rna",  rna_dict,  "RNA Score"),
         ("prot", prot_dict, "Protein Score"),
@@ -177,7 +168,7 @@ def score_sample(rna_dict, prot_dict, met_dict):
             layer_probs.append(p)
             layer_scores[label] = p
 
-    fusion_input = np.array([layer_probs])  # NaN → XGBoost handles natively
+    fusion_input = np.array([layer_probs])
     raw_prob     = float(FUSION_MODEL.predict_proba(fusion_input)[:, 1][0])
     cal_prob     = float(CALIBRATOR.predict([raw_prob])[0])
     binary       = "GBM" if raw_prob >= THRESHOLD else "Non-GBM"
@@ -192,7 +183,7 @@ def score_sample(rna_dict, prot_dict, met_dict):
 
 
 def process_dataframe(df):
-    """Score every row. Columns should be feature symbols; layer routing is automatic."""
+    """Score a user-uploaded DataFrame. Columns are plain feature symbols."""
     rna_set  = set(RNA_FEATURES)
     prot_set = set(PROT_FEATURES)
     met_set  = set(MET_FEATURES)
@@ -398,22 +389,76 @@ def build_reference_table():
 
 
 # =============================================================================
-# DEMO DATA — built from real CPTAC GBM + GTEx normal training samples
-# 5 GBM tumor (C3L/C3N, all 3 layers) + 5 GTEx normal (RNA+Prot, no met)
+# DEMO DATA — loaded directly from the original training TSV files.
+# 99 GBM (CPTAC-3) + 10 GTEx normal brain = 109 samples total.
+# RNA and protein features overlap in symbol (BSN, PCLO, PTPRT, CIT) so
+# they are stored in rna_/prot_/met_ prefixed columns to prevent mixing.
 # =============================================================================
-DEMO_CSV_PATH = "MOmics_v11_demo_data.csv"
-
 @st.cache_data
 def load_demo_data():
     try:
-        df = pd.read_csv(DEMO_CSV_PATH)
-        sample_ids  = df["Sample_ID"].tolist()
-        true_labels = df["True_Label"].tolist() if "True_Label" in df.columns else ["Unknown"] * len(df)
-        df_data = df.drop(columns=["Sample_ID", "True_Label"], errors="ignore")
-        return df_data, sample_ids, true_labels
-    except FileNotFoundError:
-        st.error(f"Demo data file '{DEMO_CSV_PATH}' not found. Ensure it is in the repo root.")
+        rna_raw  = pd.read_csv(_HERE / "rnaseq_washu_readcount_v4.0.tsv",
+                               sep="\t").set_index("gene_name")
+        prot_raw = pd.read_csv(_HERE / "proteome_mssm_per_gene_imputed_v4.0.tsv",
+                               sep="\t").set_index("gene")
+        met_raw  = pd.read_csv(_HERE / "metabolome_pnnl_v4.0.tsv",
+                               sep="\t").set_index("Metabolite")
+        manifest = pd.read_csv(_HERE / "all_subtypes_v5.1.tsv", sep="\t")
+    except FileNotFoundError as e:
+        st.error(f"Demo TSV not found: {e}. Ensure all TSV files are in the repo root.")
         st.stop()
+
+    rna_cols  = set(c for c in rna_raw.columns  if c.startswith(("C3", "PT-")))
+    prot_cols = set(c for c in prot_raw.columns if c.startswith(("C3", "PT-")))
+    met_cols  = set(c for c in met_raw.columns  if c.startswith(("C3", "PT-")))
+    label_map = dict(zip(manifest["case"], manifest["sample_type"]))
+
+    all_samples = sorted(rna_cols | prot_cols | met_cols)
+    rows = []
+    for s in all_samples:
+        true_label = "GBM" if label_map.get(s, "") == "tumor" else "Normal"
+        row = {"Sample_ID": s, "True_Label": true_label}
+        for f in RNA_FEATURES:
+            row[f"rna_{f}"]  = float(rna_raw.loc[f, s])  if (s in rna_cols  and f in rna_raw.index)  else np.nan
+        for f in PROT_FEATURES:
+            row[f"prot_{f}"] = float(prot_raw.loc[f, s]) if (s in prot_cols and f in prot_raw.index) else np.nan
+        for f in MET_FEATURES:
+            row[f"met_{f}"]  = float(met_raw.loc[f, s])  if (s in met_cols  and f in met_raw.index)  else np.nan
+        rows.append(row)
+
+    df          = pd.DataFrame(rows)
+    sample_ids  = df["Sample_ID"].tolist()
+    true_labels = df["True_Label"].tolist()
+    df_data     = df.drop(columns=["Sample_ID", "True_Label"])
+    return df_data, sample_ids, true_labels
+
+
+def process_demo_dataframe(df):
+    """
+    Score the demo DataFrame. Reads rna_/prot_/met_ prefixed columns so that
+    overlapping gene symbols route to the correct layer. Missing layers pass
+    None to the fusion model — not imputed.
+    """
+    results = []
+    for _, row in df.iterrows():
+        rna_dict  = {f: row[f"rna_{f}"]  for f in RNA_FEATURES  if pd.notna(row.get(f"rna_{f}"))}
+        prot_dict = {f: row[f"prot_{f}"] for f in PROT_FEATURES if pd.notna(row.get(f"prot_{f}"))}
+        met_dict  = {f: row[f"met_{f}"]  for f in MET_FEATURES  if pd.notna(row.get(f"met_{f}"))}
+
+        result = score_sample(
+            rna_dict  if rna_dict  else None,
+            prot_dict if prot_dict else None,
+            met_dict  if met_dict  else None,
+        )
+        for f in RNA_FEATURES:
+            result[f"rna_{f}"]  = row.get(f"rna_{f}",  np.nan)
+        for f in PROT_FEATURES:
+            result[f"prot_{f}"] = row.get(f"prot_{f}", np.nan)
+        for f in MET_FEATURES:
+            result[f"met_{f}"]  = row.get(f"met_{f}",  np.nan)
+        results.append(result)
+
+    return pd.DataFrame(results)
 
 
 # =============================================================================
@@ -441,7 +486,7 @@ st.title("MOmics | GBM Clinical Diagnostic Suite")
 if page == "Home":
     try:
         from PIL import Image
-        logo = Image.open("logo.png")
+        logo = Image.open(_HERE / "logo.png")
         st.image(logo, use_container_width=True)
     except Exception:
         st.info("Logo image not found. Please ensure 'logo.png' is in the root directory.")
@@ -497,7 +542,6 @@ elif page == "User Analysis":
         st.subheader("Manual Patient Entry")
         st.info(
             "**RNA:** enter raw read counts (log1p applied internally). "
-            
             "Do not pre-normalize. Leave a field at 0.0 to fill with training mean. "
             "Uncheck a layer to exclude it — the fusion model handles missing layers natively."
         )
@@ -528,7 +572,7 @@ elif page == "User Analysis":
                     disabled=not prot_enabled
                 )
 
-        st.write("#### Metabolomics Biomarkers ")
+        st.write("#### Metabolomics Biomarkers")
         met_cols = st.columns(3)
         for i, feat in enumerate(MET_FEATURES):
             with met_cols[i % 3]:
@@ -602,7 +646,7 @@ elif page == "User Analysis":
 
             if st.button("Run Example Analysis", type="primary", key="btn_example"):
                 try:
-                    example_df = pd.read_csv("momics_input.csv")
+                    example_df = pd.read_csv(_HERE / "momics_input.csv")
                     st.session_state.example_results = process_dataframe(example_df)
                     st.session_state.example_ran = True
                 except FileNotFoundError:
@@ -645,7 +689,6 @@ elif page == "Demo Walkthrough":
     """, unsafe_allow_html=True)
 
     demo_data, demo_sample_ids, demo_true_labels = load_demo_data()
-    # Build display labels: "C3L-00365 (GBM)" etc.
     demo_labels = [f"{sid} ({lbl})" for sid, lbl in zip(demo_sample_ids, demo_true_labels)]
     st.divider()
 
@@ -673,12 +716,11 @@ elif page == "Demo Walkthrough":
 
         if st.button("Analyze Sample Patients", key="analyze_demo_patients", type="primary"):
             with st.spinner("Running v11 inference pipeline..."):
-                st.session_state.demo_try_results = process_dataframe(demo_data)
+                st.session_state.demo_try_results = process_demo_dataframe(demo_data)
 
         if "demo_try_results" in st.session_state:
             st.markdown("---")
             st.success("Analysis Complete!")
-            # Show concordance with true labels
             res = st.session_state.demo_try_results
             concordant = sum(
                 (tl == "GBM") == (bc == "GBM")
@@ -698,14 +740,15 @@ elif page == "Demo Walkthrough":
 
         if st.session_state.tutorial_step == 0:
             st.markdown("""<div class="demo-box"><h3>Step 1: The Demo Dataset</h3>
-            <p>This demo uses real CPTAC-3 GBM tumor samples and GTEx normal brain samples —
-            the same data used to train the v11 model. 5 GBM + 5 Normal, with a mix of complete
-            (all 3 layers) and partial (RNA + Protein only) inputs.</p></div>""", unsafe_allow_html=True)
+            <p>This demo loads directly from the original training TSVs: <strong>99 CPTAC-3 GBM tumor samples</strong>
+            and <strong>10 GTEx normal brain samples</strong> (109 total). Layer availability varies per sample —
+            metabolomics is present for 75 GBM and 6 GTEx. Missing layers pass NaN to the fusion model
+            rather than being imputed.</p></div>""", unsafe_allow_html=True)
             preview_df = demo_data.copy()
             preview_df.insert(0, "Sample", demo_sample_ids)
             preview_df.insert(1, "True Label", demo_true_labels)
             st.dataframe(preview_df, use_container_width=True, hide_index=True)
-            st.caption("NaN = metabolomics layer not available for GTEx normals. XGBoost fusion handles this natively.")
+            st.caption("NaN = that layer is not available for this sample. XGBoost fusion handles this natively.")
             if st.button("Next: Run Analysis", key="tutorial_next_0"):
                 st.session_state.tutorial_step = 1
                 st.rerun()
@@ -714,11 +757,11 @@ elif page == "Demo Walkthrough":
             st.markdown("""<div class="demo-box"><h3>Step 2: The Inference Pipeline</h3>
             <p>Inputs are z-scored with frozen training parameters → scored by per-layer XGBoost sub-models
             → fused by a meta-XGBoost → optionally calibrated by isotonic regression.
-            Missing layers (metabolomics for GTEx) pass NaN to fusion — not imputed.</p></div>""",
+            Missing layers pass NaN to fusion — not imputed.</p></div>""",
                         unsafe_allow_html=True)
             if st.button("Process Sample Data", key="tutorial_analyze", type="primary"):
-                with st.spinner("Running inference..."):
-                    st.session_state.demo_results = process_dataframe(demo_data)
+                with st.spinner("Running inference on all 109 samples..."):
+                    st.session_state.demo_results = process_demo_dataframe(demo_data)
                     st.session_state.tutorial_step = 2
                 st.rerun()
 
@@ -793,8 +836,8 @@ elif page == "Demo Walkthrough":
 
         with exp_tabs[0]:
             if st.button("Load & Analyze Sample Data", key="explore_analyze", type="primary"):
-                with st.spinner("Analyzing..."):
-                    st.session_state.demo_explore_results = process_dataframe(demo_data)
+                with st.spinner("Analyzing all 109 samples..."):
+                    st.session_state.demo_explore_results = process_demo_dataframe(demo_data)
             if "demo_explore_results" in st.session_state:
                 st.success("Sample data analyzed!")
                 res = st.session_state.demo_explore_results
@@ -839,9 +882,9 @@ elif page == "Demo Walkthrough":
             st.info(
                 "**Things to Try:**\n"
                 "1. Compare a GBM sample (C3L/C3N) vs a Normal (PT-) in the individual patient selector\n"
-                "2. Notice how Normal samples score ~0.38 raw even with only 2 layers available\n"
+                "2. Notice how Normal samples score ~0.38 raw even with partial layer data\n"
                 "3. Compare raw vs calibrated scores — the gap reflects 4.6% GBM prevalence in the external set\n"
-                "4. Check the Feature Reference tab in Documentation for training z-score parameters"
+                "4. Look at the metabolomics score for samples where met layer is missing (shows N/A) vs present"
             )
 
     st.divider()
