@@ -6,3 +6,4 @@ shap
 plotly
 fpdf
 matplotlib
+joblib
