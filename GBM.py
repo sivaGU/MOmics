@@ -103,6 +103,9 @@ ALL_FEATURES  = RNA_FEATURES + PROT_FEATURES + MET_FEATURES
 SCORE_COLS = ["Prediction", "Risk Score (Raw)", "Risk Score (Calibrated)",
               "Binary Call", "RNA Score", "Protein Score", "Metabolomics Score"]
 
+# Indices into the full 109-sample sorted list to show in the demo
+DEMO_INDICES = [0, 13, 20, 104]
+
 
 # =============================================================================
 # FEATURE IMPORTANCE DF
@@ -394,7 +397,8 @@ def build_reference_table():
 
 # =============================================================================
 # DEMO DATA — loaded directly from the original training TSV files.
-# 99 GBM (CPTAC-3) + 10 GTEx normal brain = 109 samples total.
+# Full cohort: 99 GBM (CPTAC-3) + 10 GTEx normal brain = 109 samples.
+# The demo walkthrough displays only DEMO_INDICES = [0, 13, 20, 104].
 # RNA and protein features overlap in symbol (BSN, PCLO, PTPRT, CIT) so
 # they are stored in rna_/prot_/met_ prefixed columns to prevent mixing.
 # =============================================================================
@@ -435,6 +439,15 @@ def load_demo_data():
     true_labels = df["True_Label"].tolist()
     df_data     = df.drop(columns=["Sample_ID", "True_Label"])
     return df_data, sample_ids, true_labels
+
+
+def _filter_demo(df_data, sample_ids, true_labels):
+    """Slice full cohort to DEMO_INDICES only, reset index."""
+    idx = DEMO_INDICES
+    df_out      = df_data.iloc[idx].reset_index(drop=True)
+    ids_out     = [sample_ids[i]   for i in idx]
+    labels_out  = [true_labels[i]  for i in idx]
+    return df_out, ids_out, labels_out
 
 
 def process_demo_dataframe(df):
@@ -592,15 +605,12 @@ elif page == "User Analysis":
                 )
 
         if st.button("Analyze Single Patient", key="btn_manual", type="primary"):
-            # None = user left blank → _prepare_layer fills with training mean (z=0)
-            # Only pass a layer dict if the layer is enabled; otherwise pass None
-            # so the fusion model handles it natively via XGBoost missing-value handling
             rna_d  = {f: user_inputs[f] for f in RNA_FEATURES}  if rna_enabled  else None
             prot_d = {f: user_inputs[f] for f in PROT_FEATURES} if prot_enabled else None
             met_d  = {f: user_inputs[f] for f in MET_FEATURES}  if met_enabled  else None
             result = score_sample(rna_d, prot_d, met_d)
             for f in ALL_FEATURES:
-                result[f] = user_inputs.get(f)  # preserves None for display
+                result[f] = user_inputs.get(f)
             m_results = pd.DataFrame([result])
             st.success("Analysis Complete!")
             st.divider()
@@ -693,15 +703,17 @@ elif page == "Demo Walkthrough":
     <h3>Welcome to the Demo Workspace</h3>
     <p>This workspace uses real samples from the v11 training cohort — the same data the model was built on.</p>
     <ul>
-        <li><strong>5 GBM tumor samples</strong> (CPTAC-3 cohort, C3L/C3N IDs) — all 3 layers available</li>
-        <li><strong>5 GTEx normal brain samples</strong> (PT- IDs) — RNA + Protein only (no metabolomics)</li>
+        <li><strong>3 GBM tumor samples</strong> (CPTAC-3 cohort, C3L/C3N IDs) — all 3 layers available</li>
+        <li><strong>1 GTEx normal brain sample</strong> (PT- ID) — RNA + Protein only (no metabolomics)</li>
         <li>Full z-score → sub-model → fusion → isotonic calibration pipeline</li>
         <li>Raw score (for binary call) and calibrated probability (for clinical context) both shown</li>
     </ul>
     </div>
     """, unsafe_allow_html=True)
 
-    demo_data, demo_sample_ids, demo_true_labels = load_demo_data()
+    # Load full cohort (cached), then slice to the 4 selected demo patients
+    _all_data, _all_ids, _all_labels = load_demo_data()
+    demo_data, demo_sample_ids, demo_true_labels = _filter_demo(_all_data, _all_ids, _all_labels)
     demo_labels = [f"{sid} ({lbl})" for sid, lbl in zip(demo_sample_ids, demo_true_labels)]
     st.divider()
 
@@ -716,8 +728,8 @@ elif page == "Demo Walkthrough":
         st.subheader("Interactive Analysis with Sample Data")
         st.markdown("""<div class="demo-box demo-success">
         <h4>Real Patient Dataset Loaded</h4>
-        <p><strong>5 GBM tumor samples</strong> (CPTAC-3, all 3 layers) and
-        <strong>5 GTEx normal brain samples</strong> (RNA + Protein only, no metabolomics).
+        <p><strong>3 GBM tumor samples</strong> (CPTAC-3, all 3 layers) and
+        <strong>1 GTEx normal brain sample</strong> (RNA + Protein only, no metabolomics).
         Click "Analyze Sample Patients" to run the full v11 diagnostic pipeline.</p>
         </div>""", unsafe_allow_html=True)
 
@@ -753,10 +765,12 @@ elif page == "Demo Walkthrough":
 
         if st.session_state.tutorial_step == 0:
             st.markdown("""<div class="demo-box"><h3>Step 1: The Demo Dataset</h3>
-            <p>This demo loads directly from the original training TSVs: <strong>99 CPTAC-3 GBM tumor samples</strong>
-            and <strong>10 GTEx normal brain samples</strong> (109 total). Layer availability varies per sample —
-            metabolomics is present for 75 GBM and 6 GTEx. Missing layers pass NaN to the fusion model
-            rather than being imputed.</p></div>""", unsafe_allow_html=True)
+            <p>This demo uses 4 real samples from the v11 training cohort:
+            <strong>3 CPTAC-3 GBM tumor samples</strong> and
+            <strong>1 GTEx normal brain sample</strong>.
+            Layer availability varies — the normal sample has RNA + Protein only (no metabolomics).
+            Missing layers pass NaN to the fusion model rather than being imputed.</p></div>""",
+                        unsafe_allow_html=True)
             preview_df = demo_data.copy()
             preview_df.insert(0, "Sample", demo_sample_ids)
             preview_df.insert(1, "True Label", demo_true_labels)
@@ -773,7 +787,7 @@ elif page == "Demo Walkthrough":
             Missing layers pass NaN to fusion — not imputed.</p></div>""",
                         unsafe_allow_html=True)
             if st.button("Process Sample Data", key="tutorial_analyze", type="primary"):
-                with st.spinner("Running inference on all 109 samples..."):
+                with st.spinner("Running inference..."):
                     st.session_state.demo_results = process_demo_dataframe(demo_data)
                     st.session_state.tutorial_step = 2
                 st.rerun()
@@ -782,7 +796,7 @@ elif page == "Demo Walkthrough":
             st.markdown(
                 f"""<div class="demo-box demo-success"><h3>Step 3: Cohort Results</h3>
                 <p>Raw scores cluster bimodally: GBM ~0.97, Non-GBM ~0.38.
-                Youden threshold = {THRESHOLD:.4f}. GTEx normals correctly score Non-GBM
+                Youden threshold = {THRESHOLD:.4f}. The GTEx normal correctly scores Non-GBM
                 even without a metabolomics layer.</p></div>""",
                 unsafe_allow_html=True)
             if "demo_results" in st.session_state:
@@ -799,7 +813,7 @@ elif page == "Demo Walkthrough":
 
         elif st.session_state.tutorial_step == 3:
             st.markdown("""<div class="demo-box"><h3>Step 4: Individual Sample</h3>
-            <p>Compare a GBM and a Normal sample side-by-side to see how the biomarker
+            <p>Compare a GBM and the Normal sample side-by-side to see how the biomarker
             profiles differ across the panel.</p></div>""", unsafe_allow_html=True)
             if "demo_results" in st.session_state:
                 sel = st.selectbox("Choose sample:", range(len(demo_labels)),
@@ -842,14 +856,14 @@ elif page == "Demo Walkthrough":
     elif demo_mode == "Learn by Exploring":
         st.subheader("Free Exploration Mode")
         st.markdown("""<div class="demo-box"><h4>Explore at Your Own Pace</h4>
-        <p>Full interface with real CPTAC GBM tumor + GTEx normal brain samples and the v11 pipeline.</p>
+        <p>Full interface with 3 real CPTAC GBM samples and 1 GTEx normal brain sample.</p>
         </div>""", unsafe_allow_html=True)
 
         exp_tabs = st.tabs(["Sample Analysis", "Learning Resources", "Tips & Tricks"])
 
         with exp_tabs[0]:
             if st.button("Load & Analyze Sample Data", key="explore_analyze", type="primary"):
-                with st.spinner("Analyzing all 109 samples..."):
+                with st.spinner("Analyzing..."):
                     st.session_state.demo_explore_results = process_demo_dataframe(demo_data)
             if "demo_explore_results" in st.session_state:
                 st.success("Sample data analyzed!")
@@ -887,17 +901,17 @@ elif page == "Demo Walkthrough":
                     "Uncheck a layer in Manual Entry or simply omit its columns from a CSV. "
                     "The fusion model handles NaN sub-model probabilities natively via XGBoost's "
                     "missing-value mechanism — do not impute or average. "
-                    "The GTEx normal samples in this demo have no metabolomics and still score correctly."
+                    "The GTEx normal sample in this demo has no metabolomics and still scores correctly."
                 )
 
         with exp_tabs[2]:
             st.write("### Exploration Tips")
             st.info(
                 "**Things to Try:**\n"
-                "1. Compare a GBM sample (C3L/C3N) vs a Normal (PT-) in the individual patient selector\n"
-                "2. Notice how Normal samples score ~0.38 raw even with partial layer data\n"
+                "1. Compare a GBM sample (C3L/C3N) vs the Normal (PT-) in the individual patient selector\n"
+                "2. Notice how the Normal sample scores ~0.38 raw even with only 2 layers available\n"
                 "3. Compare raw vs calibrated scores — the gap reflects 4.6% GBM prevalence in the external set\n"
-                "4. Look at the metabolomics score for samples where met layer is missing (shows N/A) vs present"
+                "4. Look at the metabolomics score for the Normal sample (shows N/A) vs the GBM samples"
             )
 
     st.divider()
