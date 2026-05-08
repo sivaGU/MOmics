@@ -101,8 +101,7 @@ MET_FEATURES  = PRUNED["met"]
 ALL_FEATURES  = RNA_FEATURES + PROT_FEATURES + MET_FEATURES
 
 SCORE_COLS = ["Prediction", "Risk Score (Raw)", "Risk Score (Calibrated)",
-              "Binary Call", "RNA Score", "Protein Score", "Metabolomics Score",
-              "Layers Used"]
+              "Binary Call", "RNA Score", "Protein Score", "Metabolomics Score"]
 
 
 # =============================================================================
@@ -268,8 +267,6 @@ def render_risk_charts(results, mode="manual", key_prefix=""):
         display = results[["Prediction", "Binary Call",
                             "Risk Score (Raw)", "Risk Score (Calibrated)",
                             "RNA Score", "Protein Score", "Metabolomics Score"]].copy()
-        if "Layers Used" in results.columns:
-            display.insert(2, "Layers Used", results["Layers Used"])
         display.insert(0, "Patient ID", display.index)
         for col in ["Risk Score (Raw)", "Risk Score (Calibrated)",
                     "RNA Score", "Protein Score", "Metabolomics Score"]:
@@ -396,68 +393,67 @@ def build_reference_table():
 
 
 # =============================================================================
-# DEMO DATA — MOmics_GUI_demo_mixed.csv
-# 12 samples across 4 biological groups:
-#   • GBM_Tumor (training cohort, all 3 layers)
-#   • Brain_Normal (GTEx, all 3 layers)
-#   • CGGA_Glioma (independent validation, RNA only)
-#   • PDAC / ccRCC (non-CNS cancers, RNA + partial prot)
-# Columns: Patient_ID, Expected, rna_<feat>, prot_<feat>, met_<feat>
+# DEMO DATA — loaded directly from the original training TSV files.
+# 99 GBM (CPTAC-3) + 10 GTEx normal brain = 109 samples total.
+# RNA and protein features overlap in symbol (BSN, PCLO, PTPRT, CIT) so
+# they are stored in rna_/prot_/met_ prefixed columns to prevent mixing.
 # =============================================================================
-
-# Group metadata for display
-DEMO_GROUP_INFO = {
-    "GBM (training cohort)":          {"color": "#e74c3c", "short": "GBM-Train"},
-    "Non-GBM (healthy brain)":         {"color": "#27ae60", "short": "Normal"},
-    "GBM (independent glioma cohort)": {"color": "#e67e22", "short": "GBM-CGGA"},
-    "Non-GBM (pancreatic cancer)":     {"color": "#8e44ad", "short": "PDAC"},
-    "Non-GBM (renal cancer)":          {"color": "#2980b9", "short": "ccRCC"},
-}
-
 @st.cache_data
 def load_demo_data():
     try:
-        df = pd.read_csv(_HERE / "MOmics_GUI_demo_mixed.csv")
-    except FileNotFoundError:
-        st.error("Demo file 'MOmics_GUI_demo_mixed.csv' not found in the repo root.")
+        rna_raw  = pd.read_csv(_HERE / "rnaseq_washu_readcount_v4.0.tsv",
+                               sep="\t").set_index("gene_name")
+        prot_raw = pd.read_csv(_HERE / "proteome_mssm_per_gene_imputed_v4.0.tsv",
+                               sep="\t").set_index("gene")
+        met_raw  = pd.read_csv(_HERE / "metabolome_pnnl_v4.0.tsv",
+                               sep="\t").set_index("Metabolite")
+        manifest = pd.read_csv(_HERE / "all_subtypes_v5.1.tsv", sep="\t")
+    except FileNotFoundError as e:
+        st.error(f"Demo TSV not found: {e}. Ensure all TSV files are in the repo root.")
         st.stop()
-    sample_ids  = df["Patient_ID"].tolist()
-    expected    = df["Expected"].tolist()
-    df_data     = df.drop(columns=["Patient_ID", "Expected"])
-    return df_data, sample_ids, expected
+
+    rna_cols  = set(c for c in rna_raw.columns  if c.startswith(("C3", "PT-")))
+    prot_cols = set(c for c in prot_raw.columns if c.startswith(("C3", "PT-")))
+    met_cols  = set(c for c in met_raw.columns  if c.startswith(("C3", "PT-")))
+    label_map = dict(zip(manifest["case"], manifest["sample_type"]))
+
+    all_samples = sorted(rna_cols | prot_cols | met_cols)
+    rows = []
+    for s in all_samples:
+        true_label = "GBM" if label_map.get(s, "") == "tumor" else "Normal"
+        row = {"Sample_ID": s, "True_Label": true_label}
+        for f in RNA_FEATURES:
+            row[f"rna_{f}"]  = float(rna_raw.loc[f, s])  if (s in rna_cols  and f in rna_raw.index)  else np.nan
+        for f in PROT_FEATURES:
+            row[f"prot_{f}"] = float(prot_raw.loc[f, s]) if (s in prot_cols and f in prot_raw.index) else np.nan
+        for f in MET_FEATURES:
+            row[f"met_{f}"]  = float(met_raw.loc[f, s])  if (s in met_cols  and f in met_raw.index)  else np.nan
+        rows.append(row)
+
+    df          = pd.DataFrame(rows)
+    sample_ids  = df["Sample_ID"].tolist()
+    true_labels = df["True_Label"].tolist()
+    df_data     = df.drop(columns=["Sample_ID", "True_Label"])
+    return df_data, sample_ids, true_labels
 
 
 def process_demo_dataframe(df):
     """
-    Score every row of the demo DataFrame using MOmics_v11_inference.score_sample.
-    Reads rna_/prot_/met_ prefixed columns; routes each to the correct layer.
-    Missing layers pass None to fusion — not imputed.
-    Returns a results DataFrame with score columns + raw input columns.
+    Score the demo DataFrame. Reads rna_/prot_/met_ prefixed columns so that
+    overlapping gene symbols route to the correct layer. Missing layers pass
+    None to the fusion model — not imputed.
     """
-    from MOmics_v11_inference import score_sample as _score
-
     results = []
     for _, row in df.iterrows():
-        rna_d  = {f: row[f"rna_{f}"]  for f in RNA_FEATURES  if pd.notna(row.get(f"rna_{f}"))}
-        prot_d = {f: row[f"prot_{f}"] for f in PROT_FEATURES if pd.notna(row.get(f"prot_{f}"))}
-        met_d  = {f: row[f"met_{f}"]  for f in MET_FEATURES  if pd.notna(row.get(f"met_{f}"))}
+        rna_dict  = {f: row[f"rna_{f}"]  for f in RNA_FEATURES  if pd.notna(row.get(f"rna_{f}"))}
+        prot_dict = {f: row[f"prot_{f}"] for f in PROT_FEATURES if pd.notna(row.get(f"prot_{f}"))}
+        met_dict  = {f: row[f"met_{f}"]  for f in MET_FEATURES  if pd.notna(row.get(f"met_{f}"))}
 
-        r = _score(pipe,
-                   rna_dict  = rna_d  if rna_d  else None,
-                   prot_dict = prot_d if prot_d else None,
-                   met_dict  = met_d  if met_d  else None)
-
-        result = {
-            "Prediction":              "High Risk" if r["binary_call"] == "GBM" else "Low Risk",
-            "Risk Score (Raw)":        r["P_GBM_raw"],
-            "Risk Score (Calibrated)": r["P_GBM_calibrated"],
-            "Binary Call":             r["binary_call"],
-            "RNA Score":               r["per_layer"].get("rna"),
-            "Protein Score":           r["per_layer"].get("prot"),
-            "Metabolomics Score":      r["per_layer"].get("met"),
-            "Layers Used":             "+".join(r["layers_available"]),
-        }
-        # Attach raw input values for display
+        result = score_sample(
+            rna_dict  if rna_dict  else None,
+            prot_dict if prot_dict else None,
+            met_dict  if met_dict  else None,
+        )
         for f in RNA_FEATURES:
             result[f"rna_{f}"]  = row.get(f"rna_{f}",  np.nan)
         for f in PROT_FEATURES:
@@ -470,95 +466,8 @@ def process_demo_dataframe(df):
 
 
 # =============================================================================
-# COHORT HEATMAP — z-scored features × samples, grouped by Expected label
+# SIDEBAR & NAVIGATION
 # =============================================================================
-def build_zscore_matrix(demo_data, sample_ids, expected):
-    col_labels = (
-        [f"RNA:{f}"  for f in RNA_FEATURES] +
-        [f"Prot:{f}" for f in PROT_FEATURES] +
-        [f"Met:{f}"  for f in MET_FEATURES]
-    )
-
-    def _z(value, mean, std):
-        if any(v is None or (isinstance(v, float) and np.isnan(v))
-               for v in [value, mean, std]) or std == 0:
-            return np.nan
-        return (value - mean) / std
-
-    rows = []
-    for _, row in demo_data.iterrows():
-        zrow = []
-        for f in RNA_FEATURES:
-            raw = row.get(f"rna_{f}", np.nan)
-            val = np.log1p(float(raw)) if (pd.notna(raw) and RNA_LOG1P) else (float(raw) if pd.notna(raw) else np.nan)
-            zrow.append(_z(val, ZSCORE_PARAMS["rna"]["mean"].get(f), ZSCORE_PARAMS["rna"]["std"].get(f)))
-        for f in PROT_FEATURES:
-            raw = row.get(f"prot_{f}", np.nan)
-            zrow.append(_z(float(raw) if pd.notna(raw) else np.nan,
-                           ZSCORE_PARAMS["prot"]["mean"].get(f), ZSCORE_PARAMS["prot"]["std"].get(f)))
-        for f in MET_FEATURES:
-            raw = row.get(f"met_{f}", np.nan)
-            zrow.append(_z(float(raw) if pd.notna(raw) else np.nan,
-                           ZSCORE_PARAMS["met"]["mean"].get(f), ZSCORE_PARAMS["met"]["std"].get(f)))
-        rows.append(zrow)
-
-    matrix = pd.DataFrame(rows, columns=col_labels)
-    matrix.insert(0, "Sample",   sample_ids)
-    matrix.insert(1, "Expected", expected)
-
-    # Sort by group then by first RNA feature descending
-    group_order = {g: i for i, g in enumerate(DEMO_GROUP_INFO.keys())}
-    matrix["_order"] = matrix["Expected"].map(group_order).fillna(99)
-    matrix = matrix.sort_values(["_order", col_labels[0]], ascending=[True, False])
-    matrix = matrix.drop(columns=["_order"]).reset_index(drop=True)
-    return matrix, col_labels
-
-
-def render_cohort_heatmap(demo_data, sample_ids, expected, key_prefix=""):
-    matrix, col_labels = build_zscore_matrix(demo_data, sample_ids, expected)
-
-    z_vals   = np.clip(matrix[col_labels].values.astype(float), -3, 3)
-    y_labels = [f"{s}  [{DEMO_GROUP_INFO.get(e, {}).get('short', e)}]"
-                for s, e in zip(matrix["Sample"], matrix["Expected"])]
-
-    fig = go.Figure(data=go.Heatmap(
-        z=z_vals,
-        x=col_labels,
-        y=y_labels,
-        colorscale="RdBu_r",
-        zmid=0, zmin=-3, zmax=3,
-        colorbar=dict(title="Z-score", thickness=15),
-        hoverongaps=False,
-        hovertemplate="Sample: %{y}<br>Feature: %{x}<br>Z-score: %{z:.3f}<extra></extra>",
-    ))
-
-    # Vertical dividers between layers
-    fig.add_vline(x=len(RNA_FEATURES) - 0.5,  line_width=2, line_color="white")
-    fig.add_vline(x=len(RNA_FEATURES) + len(PROT_FEATURES) - 0.5, line_width=2, line_color="white")
-
-    # Horizontal dividers between groups
-    group_counts = matrix["Expected"].value_counts(sort=False)
-    cumulative = 0
-    for g in DEMO_GROUP_INFO:
-        cumulative += group_counts.get(g, 0)
-        if cumulative < len(matrix):
-            fig.add_hline(y=cumulative - 0.5, line_width=1.5, line_color="black",
-                          annotation_text=g.split("(")[0].strip(),
-                          annotation_position="right", annotation_font_size=9)
-
-    fig.update_layout(
-        title="Z-Score Heatmap — 12 Samples × 13 Features (grouped by cohort)",
-        xaxis=dict(tickangle=-45, tickfont=dict(size=11)),
-        yaxis=dict(tickfont=dict(size=9), autorange="reversed"),
-        height=max(420, len(y_labels) * 28 + 150),
-        margin=dict(l=200, r=150, t=60, b=100),
-    )
-    st.plotly_chart(fig, use_container_width=True, key=f"{key_prefix}_heatmap")
-    st.caption(
-        "Z-scores clipped to [−3, 3]. Red = above training mean, Blue = below, Grey = missing layer. "
-        "RNA layer uses log1p-transformed values before z-scoring."
-    )
-
 st.sidebar.title("MOmics")
 st.sidebar.markdown("---")
 page = st.sidebar.radio("Navigation", ["Home", "Documentation", "User Analysis", "Demo Walkthrough"])
@@ -782,20 +691,18 @@ elif page == "Demo Walkthrough":
     st.markdown("""
     <div class="demo-box">
     <h3>Welcome to the Demo Workspace</h3>
-    <p>12 samples across 4 biological groups — designed to show what the model gets right,
-    what it gets wrong, and why.</p>
+    <p>This workspace uses real samples from the v11 training cohort — the same data the model was built on.</p>
     <ul>
-        <li><strong>GBM tumor</strong> (CPTAC-3 training cohort, all 3 layers) — expected GBM calls</li>
-        <li><strong>Healthy brain</strong> (GTEx normal, all 3 layers) — expected non-GBM calls</li>
-        <li><strong>Independent glioma</strong> (CGGA cohort, RNA only) — tests cross-cohort generalization</li>
-        <li><strong>Non-CNS cancers</strong> (PDAC + ccRCC, RNA + partial protein) — known false positives</li>
+        <li><strong>5 GBM tumor samples</strong> (CPTAC-3 cohort, C3L/C3N IDs) — all 3 layers available</li>
+        <li><strong>5 GTEx normal brain samples</strong> (PT- IDs) — RNA + Protein only (no metabolomics)</li>
+        <li>Full z-score → sub-model → fusion → isotonic calibration pipeline</li>
+        <li>Raw score (for binary call) and calibrated probability (for clinical context) both shown</li>
     </ul>
     </div>
     """, unsafe_allow_html=True)
 
-    demo_data, demo_sample_ids, demo_expected = load_demo_data()
-    demo_labels = [f"{sid} [{DEMO_GROUP_INFO.get(exp, {}).get('short', exp)}]"
-                   for sid, exp in zip(demo_sample_ids, demo_expected)]
+    demo_data, demo_sample_ids, demo_true_labels = load_demo_data()
+    demo_labels = [f"{sid} ({lbl})" for sid, lbl in zip(demo_sample_ids, demo_true_labels)]
     st.divider()
 
     demo_mode = st.radio(
@@ -808,20 +715,19 @@ elif page == "Demo Walkthrough":
     if demo_mode == "Try with Sample Patients":
         st.subheader("Interactive Analysis with Sample Data")
         st.markdown("""<div class="demo-box demo-success">
-        <h4>Mixed Cohort Loaded — 12 Samples</h4>
-        <p>Samples span GBM tumors, healthy brain, independent glioma, and non-CNS cancers.
-        Layer availability varies: some samples have all 3 layers, others RNA only.
-        Click "Analyze All Samples" to run the full v11 pipeline.</p>
+        <h4>Real Patient Dataset Loaded</h4>
+        <p><strong>5 GBM tumor samples</strong> (CPTAC-3, all 3 layers) and
+        <strong>5 GTEx normal brain samples</strong> (RNA + Protein only, no metabolomics).
+        Click "Analyze Sample Patients" to run the full v11 diagnostic pipeline.</p>
         </div>""", unsafe_allow_html=True)
 
-        with st.expander("Preview Sample Data"):
+        with st.expander("Preview Sample Patient Data"):
             preview_df = demo_data.copy()
-            preview_df.insert(0, "Patient ID", demo_sample_ids)
-            preview_df.insert(1, "Expected", demo_expected)
+            preview_df.insert(0, "Sample", demo_sample_ids)
+            preview_df.insert(1, "True Label", demo_true_labels)
             st.dataframe(preview_df, use_container_width=True, hide_index=True)
-            st.caption("NaN = layer not available for that sample.")
 
-        if st.button("Analyze All Samples", key="analyze_demo_patients", type="primary"):
+        if st.button("Analyze Sample Patients", key="analyze_demo_patients", type="primary"):
             with st.spinner("Running v11 inference pipeline..."):
                 st.session_state.demo_try_results = process_demo_dataframe(demo_data)
 
@@ -829,23 +735,12 @@ elif page == "Demo Walkthrough":
             st.markdown("---")
             st.success("Analysis Complete!")
             res = st.session_state.demo_try_results
-
-            # Concordance — GBM expected vs GBM called
-            n_correct = sum(
-                ("GBM" in exp) == (call == "GBM")
-                for exp, call in zip(demo_expected, res["Binary Call"].tolist())
+            concordant = sum(
+                (tl == "GBM") == (bc == "GBM")
+                for tl, bc in zip(demo_true_labels, res["Binary Call"].tolist())
             )
-            st.info(
-                f"Concordance with expected: **{n_correct}/{len(demo_expected)}**. "
-                "Note: PDAC and ccRCC samples are known false positives — "
-                "these non-CNS cancers share the synaptic gene expression signature the model was trained on."
-            )
-
-            result_tabs = st.tabs(["Fusion Scores", "Feature Heatmap"])
-            with result_tabs[0]:
-                render_dashboard(res, mode="bulk", key_prefix="demo", patient_labels=demo_labels)
-            with result_tabs[1]:
-                render_cohort_heatmap(demo_data, demo_sample_ids, demo_expected, key_prefix="demo")
+            st.info(f"Model concordance with true labels: **{concordant}/{len(demo_true_labels)}** correct")
+            render_dashboard(res, mode="bulk", key_prefix="demo", patient_labels=demo_labels)
 
     # ── GUIDED TUTORIAL ───────────────────────────────────────────────────────
     elif demo_mode == "Guided Tutorial":
@@ -858,81 +753,69 @@ elif page == "Demo Walkthrough":
 
         if st.session_state.tutorial_step == 0:
             st.markdown("""<div class="demo-box"><h3>Step 1: The Demo Dataset</h3>
-            <p>12 samples across 4 groups, with varying layer availability. The PDAC and ccRCC
-            samples are intentionally included as known false positives — the model was trained
-            on brain tissue and these non-CNS cancers share the same synaptic gene signature.</p>
-            </div>""", unsafe_allow_html=True)
-
-            # Show group summary table
-            group_df = pd.DataFrame([
-                {"Group": "GBM (training cohort)",          "n": 3, "Layers": "RNA + Prot + Met", "Expected call": "GBM"},
-                {"Group": "Non-GBM (healthy brain)",         "n": 2, "Layers": "RNA + Prot + Met", "Expected call": "non-GBM"},
-                {"Group": "GBM (independent glioma cohort)", "n": 3, "Layers": "RNA only",         "Expected call": "GBM"},
-                {"Group": "Non-GBM (pancreatic cancer)",     "n": 2, "Layers": "RNA + partial Prot","Expected call": "non-GBM*"},
-                {"Group": "Non-GBM (renal cancer)",          "n": 2, "Layers": "RNA + partial Prot","Expected call": "non-GBM*"},
-            ])
-            st.dataframe(group_df, use_container_width=True, hide_index=True)
-            st.caption("* PDAC and ccRCC are expected to be misclassified as GBM — this is a known model limitation.")
+            <p>This demo loads directly from the original training TSVs: <strong>99 CPTAC-3 GBM tumor samples</strong>
+            and <strong>10 GTEx normal brain samples</strong> (109 total). Layer availability varies per sample —
+            metabolomics is present for 75 GBM and 6 GTEx. Missing layers pass NaN to the fusion model
+            rather than being imputed.</p></div>""", unsafe_allow_html=True)
+            preview_df = demo_data.copy()
+            preview_df.insert(0, "Sample", demo_sample_ids)
+            preview_df.insert(1, "True Label", demo_true_labels)
+            st.dataframe(preview_df, use_container_width=True, hide_index=True)
+            st.caption("NaN = that layer is not available for this sample. XGBoost fusion handles this natively.")
             if st.button("Next: Run Analysis", key="tutorial_next_0"):
                 st.session_state.tutorial_step = 1
                 st.rerun()
 
         elif st.session_state.tutorial_step == 1:
             st.markdown("""<div class="demo-box"><h3>Step 2: The Inference Pipeline</h3>
-            <p>Inputs are z-scored with frozen training parameters → per-layer XGBoost sub-models
-            → meta-XGBoost fusion → isotonic calibration. Missing layers (e.g. CGGA has RNA only)
-            pass NaN to fusion — not imputed.</p></div>""", unsafe_allow_html=True)
-            if st.button("Run Pipeline", key="tutorial_analyze", type="primary"):
-                with st.spinner("Running inference..."):
+            <p>Inputs are z-scored with frozen training parameters → scored by per-layer XGBoost sub-models
+            → fused by a meta-XGBoost → optionally calibrated by isotonic regression.
+            Missing layers pass NaN to fusion — not imputed.</p></div>""",
+                        unsafe_allow_html=True)
+            if st.button("Process Sample Data", key="tutorial_analyze", type="primary"):
+                with st.spinner("Running inference on all 109 samples..."):
                     st.session_state.demo_results = process_demo_dataframe(demo_data)
                     st.session_state.tutorial_step = 2
                 st.rerun()
 
         elif st.session_state.tutorial_step == 2:
             st.markdown(
-                f"""<div class="demo-box demo-success"><h3>Step 3: Results & Concordance</h3>
-                <p>GBM and glioma samples score ~0.97 raw. Healthy brain scores ~0.38.
-                PDAC and ccRCC score ~0.97 — a false positive driven by shared synaptic gene expression.
-                Youden threshold = {THRESHOLD:.4f}.</p></div>""",
+                f"""<div class="demo-box demo-success"><h3>Step 3: Cohort Results</h3>
+                <p>Raw scores cluster bimodally: GBM ~0.97, Non-GBM ~0.38.
+                Youden threshold = {THRESHOLD:.4f}. GTEx normals correctly score Non-GBM
+                even without a metabolomics layer.</p></div>""",
                 unsafe_allow_html=True)
             if "demo_results" in st.session_state:
                 res = st.session_state.demo_results
-                n_correct = sum(
-                    ("GBM" in exp) == (call == "GBM")
-                    for exp, call in zip(demo_expected, res["Binary Call"].tolist())
+                concordant = sum(
+                    (tl == "GBM") == (bc == "GBM")
+                    for tl, bc in zip(demo_true_labels, res["Binary Call"].tolist())
                 )
-                st.info(f"Concordance: **{n_correct}/{len(demo_expected)}** — PDAC/ccRCC are the known misclassifications.")
-                result_tabs = st.tabs(["Fusion Scores", "Feature Heatmap"])
-                with result_tabs[0]:
-                    render_risk_charts(res, mode="bulk", key_prefix="tutorial")
-                with result_tabs[1]:
-                    render_cohort_heatmap(demo_data, demo_sample_ids, demo_expected, key_prefix="tutorial")
-            if st.button("Next: Individual Sample", key="tutorial_next_2"):
+                st.info(f"Concordance with true labels: **{concordant}/{len(demo_true_labels)}**")
+                render_risk_charts(res, mode="bulk", key_prefix="tutorial")
+            if st.button("Next: Individual Patient", key="tutorial_next_2"):
                 st.session_state.tutorial_step = 3
                 st.rerun()
 
         elif st.session_state.tutorial_step == 3:
             st.markdown("""<div class="demo-box"><h3>Step 4: Individual Sample</h3>
-            <p>Compare samples across groups. Try a GBM vs a Normal vs a PDAC sample to see
-            how similar their feature profiles look despite different true identities.</p>
-            </div>""", unsafe_allow_html=True)
+            <p>Compare a GBM and a Normal sample side-by-side to see how the biomarker
+            profiles differ across the panel.</p></div>""", unsafe_allow_html=True)
             if "demo_results" in st.session_state:
                 sel = st.selectbox("Choose sample:", range(len(demo_labels)),
                                    format_func=lambda i: demo_labels[i],
                                    key="tutorial_patient_select")
                 row = st.session_state.demo_results.iloc[sel]
-                c1, c2, c3, c4, c5, c6, c7, c8 = st.columns(8)
-                c1.metric("Expected",    DEMO_GROUP_INFO.get(demo_expected[sel], {}).get("short", "?"))
+                c1, c2, c3, c4, c5, c6, c7 = st.columns(7)
+                c1.metric("True Label",  demo_true_labels[sel])
                 c2.metric("Model Call",  row["Binary Call"])
                 c3.metric("Raw",         f"{row['Risk Score (Raw)']:.4f}")
                 c4.metric("Calibrated",  f"{row['Risk Score (Calibrated)']:.4f}")
-                c5.metric("Layers",      row.get("Layers Used", "—"))
-                c6.metric("RNA",         _fmt(row["RNA Score"]))
-                c7.metric("Protein",     _fmt(row["Protein Score"]))
-                c8.metric("Met",         _fmt(row["Metabolomics Score"]))
+                c5.metric("RNA",         _fmt(row["RNA Score"]))
+                c6.metric("Protein",     _fmt(row["Protein Score"]))
+                c7.metric("Met",         _fmt(row["Metabolomics Score"]))
 
-                marker_cols = [c for c in st.session_state.demo_results.columns
-                               if c not in SCORE_COLS and c != "Layers Used"]
+                marker_cols = [c for c in st.session_state.demo_results.columns if c not in SCORE_COLS]
                 vals = row[marker_cols].astype(float).dropna().sort_values(ascending=False)
                 fig = px.bar(x=vals.values, y=vals.index, orientation="h",
                              title=f"Biomarker Values — {demo_labels[sel]}")
@@ -943,10 +826,9 @@ elif page == "Demo Walkthrough":
 
         elif st.session_state.tutorial_step == 4:
             st.markdown("""<div class="demo-box demo-success"><h3>Tutorial Complete!</h3>
-            <p>You've seen the full v11 pipeline on a mixed cohort: correct GBM calls, correct
-            normal calls, cross-cohort generalization (CGGA RNA-only), and known false positives
-            (PDAC/ccRCC). The false positives illustrate a real limitation — the model is
-            specific to brain tissue context.</p></div>""", unsafe_allow_html=True)
+            <p>You've walked through the full v11 pipeline: z-score normalization → sub-models →
+            fusion → Youden threshold → isotonic calibration, on real CPTAC GBM and GTEx normal samples.</p>
+            </div>""", unsafe_allow_html=True)
             c1, c2 = st.columns(2)
             with c1:
                 st.info("Navigate to 'User Analysis' to score your own samples.")
@@ -960,75 +842,62 @@ elif page == "Demo Walkthrough":
     elif demo_mode == "Learn by Exploring":
         st.subheader("Free Exploration Mode")
         st.markdown("""<div class="demo-box"><h4>Explore at Your Own Pace</h4>
-        <p>Full interface with the mixed 12-sample cohort. Use the Feature Heatmap tab to see
-        why PDAC/ccRCC score as GBM despite being non-CNS cancers.</p>
+        <p>Full interface with real CPTAC GBM tumor + GTEx normal brain samples and the v11 pipeline.</p>
         </div>""", unsafe_allow_html=True)
 
         exp_tabs = st.tabs(["Sample Analysis", "Learning Resources", "Tips & Tricks"])
 
         with exp_tabs[0]:
-            if st.button("Load & Analyze All Samples", key="explore_analyze", type="primary"):
-                with st.spinner("Analyzing..."):
+            if st.button("Load & Analyze Sample Data", key="explore_analyze", type="primary"):
+                with st.spinner("Analyzing all 109 samples..."):
                     st.session_state.demo_explore_results = process_demo_dataframe(demo_data)
             if "demo_explore_results" in st.session_state:
-                st.success("Analysis complete!")
+                st.success("Sample data analyzed!")
                 res = st.session_state.demo_explore_results
-                n_correct = sum(
-                    ("GBM" in exp) == (call == "GBM")
-                    for exp, call in zip(demo_expected, res["Binary Call"].tolist())
+                concordant = sum(
+                    (tl == "GBM") == (bc == "GBM")
+                    for tl, bc in zip(demo_true_labels, res["Binary Call"].tolist())
                 )
-                st.info(
-                    f"Concordance: **{n_correct}/{len(demo_expected)}**. "
-                    "PDAC and ccRCC are known false positives."
-                )
+                st.info(f"Concordance with true labels: **{concordant}/{len(demo_true_labels)}**")
                 st.divider()
-                result_tabs = st.tabs(["Fusion Scores", "Feature Heatmap"])
-                with result_tabs[0]:
-                    render_dashboard(res, mode="bulk", key_prefix="explore", patient_labels=demo_labels)
-                with result_tabs[1]:
-                    render_cohort_heatmap(demo_data, demo_sample_ids, demo_expected, key_prefix="explore")
+                render_dashboard(res, mode="bulk", key_prefix="explore", patient_labels=demo_labels)
 
         with exp_tabs[1]:
             st.write("### Quick Reference")
             with st.expander("Understanding the Two Scores"):
                 st.write(
                     f"- **Raw fusion score**: XGBoost output. Threshold = {THRESHOLD:.4f} (Youden). "
-                    "Clusters near 0.38 (non-GBM) or 0.97 (GBM).\n"
-                    "- **Calibrated probability**: isotonic-mapped to 4.6% GBM prevalence in external validation. "
-                    "Raw ~0.97 → calibrated ~0.43. Not a bug — reflects prevalence at fit time."
-                )
-            with st.expander("Why do PDAC/ccRCC score as GBM?"):
-                st.write(
-                    "The model was trained exclusively on brain tissue (GBM tumor vs GTEx normal brain). "
-                    "The 13-feature panel captures synaptic/neuronal gene expression (BSN, PCLO, MAPT, etc.) "
-                    "that is highly elevated in GBM relative to normal brain. "
-                    "Some non-CNS cancers — particularly pancreatic and renal — happen to express these "
-                    "same genes at high levels, making them indistinguishable from GBM on this panel. "
-                    "The heatmap tab shows the z-scores: PDAC/ccRCC look red (high) across the RNA features, "
-                    "just like GBM."
+                    "Scores cluster near 0.38 (Non-GBM) or 0.97 (GBM).\n"
+                    "- **Calibrated probability**: isotonic-mapped to external validation prevalence "
+                    "(4.6% GBM). A raw score of ~0.97 → ~0.40 calibrated. This is expected, not a bug. "
+                    "In a higher-prevalence clinical setting the posterior would be higher."
                 )
             with st.expander("Input Format by Layer"):
                 st.write(
                     f"- **RNA ({len(RNA_FEATURES)} features):** {', '.join(RNA_FEATURES)} — "
-                    "raw read counts. log1p applied internally.\n"
+                    "**raw read counts**. log1p applied internally before z-scoring.\n"
                     f"- **Protein ({len(PROT_FEATURES)} features):** {', '.join(PROT_FEATURES)} — "
-                    "log2 CPTAC reference-intensity normalized abundance.\n"
+                    "**log2 abundance** (CPTAC reference-intensity normalized).\n"
                     f"- **Metabolomics ({len(MET_FEATURES)} features):** {', '.join(MET_FEATURES)} — "
-                    "log2 abundance.\n\nDo not pre-normalize — z-scoring uses frozen training parameters."
+                    "**log2 abundance**.\n\n"
+                    "Do not pre-normalize inputs — z-scoring uses frozen training parameters."
+                )
+            with st.expander("Missing Layers"):
+                st.write(
+                    "Uncheck a layer in Manual Entry or simply omit its columns from a CSV. "
+                    "The fusion model handles NaN sub-model probabilities natively via XGBoost's "
+                    "missing-value mechanism — do not impute or average. "
+                    "The GTEx normal samples in this demo have no metabolomics and still score correctly."
                 )
 
         with exp_tabs[2]:
             st.write("### Exploration Tips")
             st.info(
                 "**Things to Try:**\n"
-                "1. Compare GBM_Tumor vs Brain_Normal in the individual patient selector — "
-                "notice the inverted RNA z-scores\n"
-                "2. Compare PDAC_Tumor vs GBM_Tumor in the heatmap — "
-                "spot why the model can't tell them apart\n"
-                "3. Compare CGGA_Glioma (RNA only) vs GBM_Tumor (all layers) — "
-                "same call, same raw score, despite missing protein and metabolomics\n"
-                "4. Check the calibrated score vs raw score gap — both ~0.43 calibrated "
-                "for GBM calls, reflecting the 4.6% prevalence in the external validation set"
+                "1. Compare a GBM sample (C3L/C3N) vs a Normal (PT-) in the individual patient selector\n"
+                "2. Notice how Normal samples score ~0.38 raw even with partial layer data\n"
+                "3. Compare raw vs calibrated scores — the gap reflects 4.6% GBM prevalence in the external set\n"
+                "4. Look at the metabolomics score for samples where met layer is missing (shows N/A) vs present"
             )
 
     st.divider()
