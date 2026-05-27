@@ -655,25 +655,53 @@ elif page == "User Analysis":
                 st.info("Ensure columns match feature symbols in the template.")
 
     # ── EXAMPLE ANALYSIS ──────────────────────────────────────────────────────
+    # ── EXAMPLE ANALYSIS ──────────────────────────────────────────────────────
     with analysis_tabs[2]:
         st.subheader("Example Analysis")
         st.write(
-            "Runs the full v11 inference pipeline on a pre-loaded CPTAC GBM patient sample. "
-            "Input file (`momics_input.csv`) should have columns matching the v11 feature symbols."
+            "Runs the full v11 inference pipeline on two pre-loaded patient samples — "
+            "one with a high-risk GBM profile and one with a low-risk profile. "
+            "No file upload required."
         )
+
+        def _generate_mock_patients():
+            rng = np.random.default_rng(42)
+            rows = []
+            for label, rna_z, prot_z, met_z in [
+                ("Patient A (High Risk)", +1.5, +1.5, +1.5),
+                ("Patient B (Low Risk)",  -0.5, -0.5, -0.5),
+            ]:
+                row = {"Sample ID": label}
+                for f in RNA_FEATURES:
+                    mean = ZSCORE_PARAMS["rna"]["mean"].get(f, 0.0)
+                    std  = ZSCORE_PARAMS["rna"]["std"].get(f, 1.0) or 1.0
+                    log1p_val = mean + rna_z * std + rng.normal(0, 0.05)
+                    row[f] = float(np.expm1(max(log1p_val, 0.0)))
+                for f in PROT_FEATURES:
+                    mean = ZSCORE_PARAMS["prot"]["mean"].get(f, 0.0)
+                    std  = ZSCORE_PARAMS["prot"]["std"].get(f, 1.0) or 1.0
+                    row[f] = float(mean + prot_z * std + rng.normal(0, 0.05))
+                for f in MET_FEATURES:
+                    mean = ZSCORE_PARAMS["met"]["mean"].get(f, 0.0)
+                    std  = ZSCORE_PARAMS["met"]["std"].get(f, 1.0) or 1.0
+                    row[f] = float(mean + met_z * std + rng.normal(0, 0.05))
+                rows.append(row)
+            return pd.DataFrame(rows)
+
         col_ex1, col_ex2 = st.columns([1, 2])
         with col_ex1:
-            st.markdown("**Input file:** `momics_input.csv`")
-            st.markdown("**Sample:** CPTAC-3 GBM patient")
+            st.markdown("**Patient A:** High-risk profile")
+            st.markdown("**Patient B:** Low-risk profile")
             st.markdown("**RNA:** raw read counts | **Prot/Met:** log2 abundance")
 
             if st.button("Run Example Analysis", type="primary", key="btn_example"):
                 try:
-                    example_df = pd.read_csv(_HERE / "momics_input.csv")
-                    st.session_state.example_results = process_dataframe(example_df)
+                    example_df = _generate_mock_patients()
+                    score_df = example_df.drop(columns=["Sample ID"])
+                    results = process_dataframe(score_df)
+                    results.insert(0, "Sample ID", example_df["Sample ID"].values)
+                    st.session_state.example_results = results
                     st.session_state.example_ran = True
-                except FileNotFoundError:
-                    st.error("`momics_input.csv` not found in the repo root.")
                 except Exception as e:
                     st.error(f"Error running example: {e}")
 
@@ -684,14 +712,23 @@ elif page == "User Analysis":
                     st.rerun()
 
         with col_ex2:
+            with st.expander("Preview patient input data"):
+                try:
+                    preview = _generate_mock_patients()
+                    st.dataframe(preview, use_container_width=True, hide_index=True)
+                except Exception:
+                    st.info("Click 'Run Example Analysis' to generate and preview the data.")
             with st.expander("v11 feature panel"):
                 st.dataframe(build_reference_table(), use_container_width=True, hide_index=True)
 
         if st.session_state.get("example_ran") and "example_results" in st.session_state:
             st.divider()
             st.subheader("Example Results")
-            render_dashboard(st.session_state.example_results, mode="bulk", key_prefix="ex")
-
+            res = st.session_state.example_results
+            render_res = res.drop(columns=["Sample ID"], errors="ignore")
+            patient_labels = res["Sample ID"].tolist() if "Sample ID" in res.columns else None
+            render_dashboard(render_res, mode="bulk", key_prefix="ex",
+                             patient_labels=patient_labels)
 
 # =============================================================================
 # DEMO WALKTHROUGH PAGE
