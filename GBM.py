@@ -503,15 +503,7 @@ if page == "Home":
     st.markdown("<h1 style='text-align: center;'>MOmics</h1>", unsafe_allow_html=True)
     st.markdown("<h3 style='text-align: center;'>GBM Clinical Diagnostic Suite</h3>", unsafe_allow_html=True)
 
-    st.divider()
-    st.subheader("Discovery Cohort Performance")
-    c1, c2, c3, c4, c5, c6 = st.columns(6)
-    c1.metric("RNA OOF AUROC",   f"{DISCOVERY.get('rna_oof_auc', 0):.4f}")
-    c2.metric("Prot OOF AUROC",  f"{DISCOVERY.get('prot_oof_auc', 0):.4f}")
-    c3.metric("Met OOF AUROC",   f"{DISCOVERY.get('met_oof_auc', 0):.4f}")
-    c4.metric("Fusion AUROC",    f"{DISCOVERY.get('fusion_auc', 0):.4f}")
-    c5.metric("Sensitivity",     f"{DISCOVERY.get('fusion_sens', 0):.1%}")
-    c6.metric("Specificity",     f"{DISCOVERY.get('fusion_spec', 0):.1%}")
+
 
 # Documentation
 
