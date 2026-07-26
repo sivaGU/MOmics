@@ -394,7 +394,7 @@ def build_reference_table():
 # The demo walkthrough displays only DEMO_INDICES = [0, 13, 20, 104] because storage reasons.
 # RNA and protein features overlap in symbol (BSN, PCLO, PTPRT, CIT) so
 # they are stored in rna_/prot_/met_ prefixed columns to prevent mixing.
-=
+
 @st.cache_data
 def load_demo_data():
     try:
