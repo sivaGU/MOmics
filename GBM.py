@@ -648,7 +648,7 @@ elif page == "User Analysis":
     with analysis_tabs[2]:
         st.subheader("Example Analysis")
         st.write(
-            "Runs the full v11 inference pipeline on two pre-loaded patient samples — "
+            "Uses two preloaded samples and runs the model using values from those samples"
             "one with a high-risk GBM profile and one with a low-risk profile. "
             "No file upload required."
         )
