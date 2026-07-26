@@ -7,13 +7,13 @@ import joblib
 from pathlib import Path
 from docs import OVERVIEW, GUI_GUIDE, MODEL_ARCH
 
-# Resolve all asset paths relative to this script
+#path to the files required 
 _HERE = Path(__file__).parent
 
-# --- Page Configuration ---
+# Page Configuration 
 st.set_page_config(page_title="MOmics", layout="wide", page_icon="🧬")
 
-# --- Custom CSS ---
+# CSS for the website
 st.markdown("""
     <style>
     [data-testid="stSidebar"] {
@@ -76,9 +76,8 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 
-# =============================================================================
-# PIPELINE LOADING
-# =============================================================================
+# Loading pipline for the model
+
 @st.cache_resource
 def load_pipeline():
     return joblib.load(_HERE / "MOmics_v11_locked_pipeline.pkl")
@@ -103,13 +102,13 @@ ALL_FEATURES  = RNA_FEATURES + PROT_FEATURES + MET_FEATURES
 SCORE_COLS = ["Prediction", "Risk Score (Raw)", "Risk Score (Calibrated)",
               "Binary Call", "RNA Score", "Protein Score", "Metabolomics Score"]
 
-# Indices into the full 109-sample sorted list to show in the demo
+# Indices the full 109-sample used for the demo for condensed and better representation
 DEMO_INDICES = [0, 13, 20, 104]
 
 
-# =============================================================================
-# FEATURE IMPORTANCE DF
-# =============================================================================
+
+# The list of features the model relies on
+
 def _build_importance_df():
     rows = []
     layer_map = {"rna": "RNA", "prot": "Protein", "met": "Metabolomics"}
@@ -122,10 +121,7 @@ def _build_importance_df():
 
 importance_df_display = _build_importance_df()
 
-
-# =============================================================================
-# INFERENCE PIPELINE
-# =============================================================================
+# Inference pipeline
 
 def _zscore(value, mean, std):
     if std is None or np.isnan(std) or std == 0:
@@ -213,9 +209,9 @@ def process_dataframe(df):
     return pd.DataFrame(results)
 
 
-# =============================================================================
-# VISUALIZATION HELPERS
-# =============================================================================
+
+# Visualizations
+
 
 def _fmt(val):
     if val is None or (isinstance(val, float) and np.isnan(val)):
@@ -369,10 +365,7 @@ def render_dashboard(results, mode="manual", key_prefix="", patient_labels=None)
         all_markers = all_markers.sort_values("Value", ascending=False)
         st.dataframe(all_markers, use_container_width=True, hide_index=True)
 
-
-# =============================================================================
-# REFERENCE TABLE
-# =============================================================================
+# Reference table
 def build_reference_table():
     rows = []
     layer_label = {"rna": "RNA", "prot": "Protein", "met": "Metabolomics"}
@@ -395,13 +388,13 @@ def build_reference_table():
     return pd.DataFrame(rows)
 
 
-# =============================================================================
-# DEMO DATA — loaded directly from the original training TSV files.
-# Full cohort: 99 GBM (CPTAC-3) + 10 GTEx normal brain = 109 samples.
-# The demo walkthrough displays only DEMO_INDICES = [0, 13, 20, 104].
+
+# Training files for demo section 
+# Full cohort of the  99 GBM (CPTAC-3) + 10 GTEx normal brain = 109 samples.
+# The demo walkthrough displays only DEMO_INDICES = [0, 13, 20, 104] because storage reasons.
 # RNA and protein features overlap in symbol (BSN, PCLO, PTPRT, CIT) so
 # they are stored in rna_/prot_/met_ prefixed columns to prevent mixing.
-# =============================================================================
+=
 @st.cache_data
 def load_demo_data():
     try:
@@ -478,9 +471,9 @@ def process_demo_dataframe(df):
     return pd.DataFrame(results)
 
 
-# =============================================================================
-# SIDEBAR & NAVIGATION
-# =============================================================================
+
+# Sidebar
+
 st.sidebar.title("MOmics")
 st.sidebar.markdown("---")
 page = st.sidebar.radio("Navigation", ["Home", "Documentation", "User Analysis", "Demo Walkthrough"])
@@ -497,9 +490,9 @@ st.sidebar.markdown(f"")
 st.title("MOmics | GBM Clinical Diagnostic Suite")
 
 
-# =============================================================================
-# HOME PAGE
-# =============================================================================
+
+# Home page
+
 if page == "Home":
     try:
         from PIL import Image
@@ -520,10 +513,8 @@ if page == "Home":
     c5.metric("Sensitivity",     f"{DISCOVERY.get('fusion_sens', 0):.1%}")
     c6.metric("Specificity",     f"{DISCOVERY.get('fusion_spec', 0):.1%}")
 
+# Documentation
 
-# =============================================================================
-# DOCUMENTATION PAGE
-# =============================================================================
 elif page == "Documentation":
     st.header("System Documentation")
     doc_tabs = st.tabs(["Overview", "GUI User Guide", "Model Architecture", "Feature Reference"])
@@ -547,14 +538,13 @@ elif page == "Documentation":
         st.dataframe(ref_df, use_container_width=True, hide_index=True)
 
 
-# =============================================================================
-# USER ANALYSIS PAGE
-# =============================================================================
+# User analysis/main page
+
 elif page == "User Analysis":
     st.header("User Analysis")
     analysis_tabs = st.tabs(["Manual Patient Entry", "Bulk Data Upload", "Example Analysis"])
 
-    # ── MANUAL ENTRY ─────────────────────────────────────────────────────────
+    # Manual entry section
     with analysis_tabs[0]:
         st.subheader("Manual Patient Entry")
         st.info(
@@ -616,7 +606,7 @@ elif page == "User Analysis":
             st.divider()
             render_dashboard(m_results, mode="manual", key_prefix="man")
 
-    # ── BULK UPLOAD ───────────────────────────────────────────────────────────
+    #  Bulk upload section
     with analysis_tabs[1]:
         st.subheader("Bulk Data Processing")
         col_t1, col_t2 = st.columns([2, 1])
@@ -654,8 +644,7 @@ elif page == "User Analysis":
                 st.error(f"Error processing file: {e}")
                 st.info("Ensure columns match feature symbols in the template.")
 
-    # ── EXAMPLE ANALYSIS ──────────────────────────────────────────────────────
-    # ── EXAMPLE ANALYSIS ──────────────────────────────────────────────────────
+    # Example section
     with analysis_tabs[2]:
         st.subheader("Example Analysis")
         st.write(
@@ -730,9 +719,7 @@ elif page == "User Analysis":
             render_dashboard(render_res, mode="bulk", key_prefix="ex",
                              patient_labels=patient_labels)
 
-# =============================================================================
-# DEMO WALKTHROUGH PAGE
-# =============================================================================
+# Demo walkthrough
 elif page == "Demo Walkthrough":
     st.header("Interactive Demo Workspace")
     st.markdown("""
@@ -760,7 +747,7 @@ elif page == "Demo Walkthrough":
         horizontal=True
     )
 
-    # ── TRY WITH SAMPLE PATIENTS ─────────────────────────────────────────────
+    
     if demo_mode == "Try with Sample Patients":
         st.subheader("Interactive Analysis with Sample Data")
         st.markdown("""<div class="demo-box demo-success">
@@ -791,7 +778,7 @@ elif page == "Demo Walkthrough":
             st.info(f"Model concordance with true labels: **{concordant}/{len(demo_true_labels)}** correct")
             render_dashboard(res, mode="bulk", key_prefix="demo", patient_labels=demo_labels)
 
-    # ── GUIDED TUTORIAL ───────────────────────────────────────────────────────
+    #  GUIDED TUTORIAL
     elif demo_mode == "Guided Tutorial":
         st.subheader("Step-by-Step Guided Tutorial")
         if "tutorial_step" not in st.session_state:
@@ -889,7 +876,7 @@ elif page == "Demo Walkthrough":
                     st.session_state.pop("demo_results", None)
                     st.rerun()
 
-    # ── LEARN BY EXPLORING ────────────────────────────────────────────────────
+    # LEARN BY EXPLORING
     elif demo_mode == "Learn by Exploring":
         st.subheader("Free Exploration Mode")
         st.markdown("""<div class="demo-box"><h4>Explore at Your Own Pace</h4>
