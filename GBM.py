@@ -502,7 +502,7 @@ if page == "Home":
         st.info("Logo image not found. Please ensure 'logo.png' is in the root directory.")
     st.markdown("<h1 style='text-align: center;'>MOmics</h1>", unsafe_allow_html=True)
     st.markdown("<h3 style='text-align: center;'>GBM Clinical Diagnostic Suite</h3>", unsafe_allow_html=True)
-        st.markdown("---")
+    st.markdown("---")
     st.markdown("### Contact Information")
     st.markdown(
         "**For Contact:** Dr. Sivanesan Dakshanamurthy, PhD, MBA. "
