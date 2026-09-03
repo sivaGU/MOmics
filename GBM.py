@@ -503,11 +503,12 @@ if page == "Home":
     st.markdown("<h1 style='text-align: center;'>MOmics</h1>", unsafe_allow_html=True)
     st.markdown("<h3 style='text-align: center;'>GBM Clinical Diagnostic Suite</h3>", unsafe_allow_html=True)
     st.markdown("---")
-    st.markdown("## Contact Information")
+    st.markdown('<div style="font-size: 28px; font-weight: 600; margin-bottom: 10px;">Contact Information</div>', unsafe_allow_html=True)
     st.markdown(
-        "**For Contact:** Dr. Sivanesan Dakshanamurthy, PhD, MBA. "
-        "[sivanesan@innsciteai.com](mailto:sivanesan@innsciteai.com); "
-        "[sd233@georgetown.edu](mailto:sd233@georgetown.edu)"
+        '<div style="font-size: 20px;"><b>For Contact:</b> Dr. Sivanesan Dakshanamurthy, PhD, MBA. '
+        '<a href="mailto:sivanesan@innsciteai.com">sivanesan@innsciteai.com</a>; '
+        '<a href="mailto:sd233@georgetown.edu">sd233@georgetown.edu</a></div>',
+        unsafe_allow_html=True
     )
 
 
