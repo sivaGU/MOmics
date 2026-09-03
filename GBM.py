@@ -503,7 +503,7 @@ if page == "Home":
     st.markdown("<h1 style='text-align: center;'>MOmics</h1>", unsafe_allow_html=True)
     st.markdown("<h3 style='text-align: center;'>GBM Clinical Diagnostic Suite</h3>", unsafe_allow_html=True)
     st.markdown("---")
-    st.markdown("### Contact Information")
+    st.markdown("## Contact Information")
     st.markdown(
         "**For Contact:** Dr. Sivanesan Dakshanamurthy, PhD, MBA. "
         "[sivanesan@innsciteai.com](mailto:sivanesan@innsciteai.com); "
