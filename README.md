@@ -8,7 +8,7 @@ Requirements:
 MOmics_GBM_Project Structure: 
 ## Project Structure
 ```
-MOmics_GBM_Project/
+**MOmics_GBM_Project/
 ├── momics_app.py                     # Main Streamlit GUI application
 ├── ml_pipeline.py                    # XGBoost training + prediction pipeline
 ├── feature_selection.py              # Feature selection + rank transformation
@@ -77,6 +77,6 @@ MOmics_GBM_Project/
     ├── Supplementary_Tables/
     ├── Supplementary_Figures/
     └── Supplementary_Code/
-```
+```**
 Contant: 
 Questions and bug reports, please contact: Dr. Sivanesan Dakshanamurthy: sd233@georgetown.edu
