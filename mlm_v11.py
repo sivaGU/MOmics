@@ -47,9 +47,12 @@ from xgboost import XGBClassifier
 warnings.filterwarnings("ignore")
 np.random.seed(42)
 
-# CONFIG: edit these two paths
-UPLOADS = Path("/content")    # where you put the data files
-OUT_DIR = Path("/content/v11_run")                       # where outputs go
+# CONFIG: project-relative paths
+PROJECT_ROOT = Path(__file__).resolve().parent
+DISCOVERY_DIR = PROJECT_ROOT / "data" / "discovery"
+REFERENCE_DIR = PROJECT_ROOT / "data" / "reference"
+EXTERNAL_DIR = PROJECT_ROOT / "data" / "external_validation"
+OUT_DIR = PROJECT_ROOT / "results" / "v11_run"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # toggles
@@ -86,7 +89,7 @@ FUSION_PARAMS = dict(n_estimators=30, max_depth=2, learning_rate=0.1, reg_lambda
 # DIABLO + mapping
 
 def load_diablo_panel():
-    df = pd.read_csv(UPLOADS / "diablo_multiomics_ranked_features_FDR_CLEAN.csv")
+    df = pd.read_csv(REFERENCE_DIR / "diablo_multiomics_ranked_features_FDR_CLEAN.csv")
     df = df.sort_values("combined_weight", ascending=False)
     is_rna  = df["contributing_blocks"].isin(["transcriptomics", "proteomics;transcriptomics"])
     is_prot = df["contributing_blocks"].isin(["proteomics", "proteomics;transcriptomics"])
@@ -97,7 +100,7 @@ def load_diablo_panel():
 
 
 def build_symbol_to_ensg():
-    df = pd.read_csv(UPLOADS / "rnaseq_washu_readcount.v4.0.tsv", sep="\t", low_memory=False)
+    df = pd.read_csv(DISCOVERY_DIR / "rnaseq_washu_readcount.v4.0.tsv", sep="\t", low_memory=False)
     sample_cols = [c for c in df.columns if c.startswith("C3L") or c.startswith("C3N")]
     df["_mean"] = df[sample_cols].mean(axis=1)
     df["_ensg"] = df["gene_id"].astype(str).str.split(".").str[0]
@@ -127,7 +130,7 @@ def _filter_to_features(df, feat_col, target, sample_cols):
 # discovery loaders
 
 def load_discovery_rna(features, manifest):
-    df = pd.read_csv(UPLOADS / "rnaseq_washu_readcount.v4.0.tsv", sep="\t", low_memory=False)
+    df = pd.read_csv(DISCOVERY_DIR / "rnaseq_washu_readcount.v4.0.tsv", sep="\t", low_memory=False)
     sample_cols = [c for c in df.columns if c in manifest]
     matrix = _filter_to_features(df, "gene_name", features, sample_cols)
     n = matrix.notna().any(axis=1).sum()
@@ -136,7 +139,7 @@ def load_discovery_rna(features, manifest):
 
 
 def load_discovery_prot(features, manifest):
-    df = pd.read_csv(UPLOADS / "proteome_mssm_per_gene_imputed.v4.0.tsv", sep="\t", low_memory=False)
+    df = pd.read_csv(DISCOVERY_DIR / "proteome_mssm_per_gene_imputed.v4.0.tsv", sep="\t", low_memory=False)
     sample_cols = [c for c in df.columns if c in manifest]
     matrix = _filter_to_features(df, "gene", features, sample_cols)
     n = matrix.notna().any(axis=1).sum()
@@ -145,7 +148,7 @@ def load_discovery_prot(features, manifest):
 
 
 def load_discovery_met(features, manifest):
-    df = pd.read_csv(UPLOADS / "metabolome_pnnl.v4.0.tsv", sep="\t", low_memory=False)
+    df = pd.read_csv(DISCOVERY_DIR / "metabolome_pnnl.v4.0.tsv", sep="\t", low_memory=False)
     sample_cols = [c for c in df.columns if c in manifest]
     matrix = _filter_to_features(df, "Metabolite", features, sample_cols)
     n = matrix.notna().any(axis=1).sum()
@@ -201,7 +204,7 @@ def _load_by_symbol(file_path, target_symbols, feat_col, sep="\t"):
 
 
 def _load_cgga_prot(target_symbols):
-    fp = UPLOADS / "CGGA_IDH_A_Proteomics_MS_Abundance_20250915.txt"
+    fp = EXTERNAL_DIR / "CGGA" / "CGGA_IDH_A_Proteomics_MS_Abundance_20250915.txt"
     df = pd.read_csv(fp, sep="\t", low_memory=False)
     sample_cols = detect_samples(df, exclude={"Protein.Group", "Genes"})
     df["Genes"] = df["Genes"].astype(str)
@@ -383,7 +386,7 @@ def main():
     print(f"  Prot ({len(panel['prot']):2d}): {panel['prot']}")
     print(f"  Met  ({len(panel['met']):2d}): {panel['met']}")
 
-    manifest_df = pd.read_csv(UPLOADS / "all_subtypes.v5.1.tsv", sep="\t")
+    manifest_df = pd.read_csv(DISCOVERY_DIR / "all_subtypes.v5.1.tsv", sep="\t")
     manifest = {}
     for _, r in manifest_df.iterrows():
         if r["sample_type"] == "tumor":         manifest[r["case"]] = 1
@@ -465,7 +468,7 @@ def main():
     print(f"\n External validation")
     externals = {}
     externals["CGGA"] = {"label": 1, "matrices": {
-        "rna":  _load_by_symbol(UPLOADS / "CGGA_IDH_A_RNAseq_RSEM_20250915.txt", panel["rna"], feat_col="Gene"),
+        "rna":  _load_by_symbol(EXTERNAL_DIR / "CGGA" / "CGGA_IDH_A_RNAseq_RSEM_20250915.txt", panel["rna"], feat_col="Gene"),
         "prot": _load_cgga_prot(panel["prot"]),
         "met":  None}}
 
@@ -474,14 +477,14 @@ def main():
                                        ("LUAD", "LUAD", True)]:
         for kind in (["Tumor", "Normal"] if has_normal else ["Tumor"]):
             externals[f"{cohort}_{kind.lower()}"] = {"label": 0, "matrices": {
-                "rna":  _load_by_ensg(UPLOADS / f"{prefix}_RNAseq_gene_RSEM_coding_UQ_1500_log2_{kind}.txt", panel["rna"], sym2ensg),
-                "prot": _load_by_ensg(UPLOADS / f"{prefix}_proteomics_gene_abundance_log2_reference_intensity_normalized_{kind}.txt", panel["prot"], sym2ensg),
+                "rna":  _load_by_ensg(EXTERNAL_DIR / cohort / f"{prefix}_RNAseq_gene_RSEM_coding_UQ_1500_log2_{kind}.txt", panel["rna"], sym2ensg),
+                "prot": _load_by_ensg(EXTERNAL_DIR / cohort / f"{prefix}_proteomics_gene_abundance_log2_reference_intensity_normalized_{kind}.txt", panel["prot"], sym2ensg),
                 "met":  None}}
 
     for kind, fkind in [("Tumor", "tumor"), ("Normal", "normal")]:
         externals[f"PDAC_{fkind}"] = {"label": 0, "matrices": {
-            "rna":  _load_by_symbol(UPLOADS / f"mRNA_RSEM_UQ_log2_{kind}.cct.csv", panel["rna"], feat_col="Unnamed: 0", sep=","),
-            "prot": _load_by_symbol(UPLOADS / f"proteomics_gene_level_MD_abundance_{fkind}.cct.csv", panel["prot"], feat_col="Unnamed: 0", sep=","),
+            "rna":  _load_by_symbol(DISCOVERY_DIR / f"mRNA_RSEM_UQ_log2_{kind}.cct.csv", panel["rna"], feat_col="Unnamed: 0", sep=","),
+            "prot": _load_by_symbol(DISCOVERY_DIR / f"proteomics_gene_level_MD_abundance_{fkind}.cct.csv", panel["prot"], feat_col="Unnamed: 0", sep=","),
             "met":  None}}
 
     # Z-score parameter dispatch by layer
@@ -619,10 +622,9 @@ def _safe_read_csv(*args, **kwargs):
 _safe_read_csv.__momics_wrapped__ = _pd_read_csv_truly_original
 pd.read_csv = _safe_read_csv
 
-UPLOADS  = Path("/content")
-RUN_DIR  = Path("/content/v11_run")
+RUN_DIR  = OUT_DIR
 PKL_PATH = RUN_DIR / "MOmics_v11_locked_pipeline.pkl"
-FIG_DIR  = Path("/content/v11_paper_figures")
+FIG_DIR  = PROJECT_ROOT / "results" / "v11_paper_figures"
 FIG_DIR.mkdir(parents=True, exist_ok=True)
 
 plt.rcParams.update({
@@ -818,11 +820,11 @@ def load_by_ensg(fp, target):
     return M
 
 manifest = {}
-for _, r in pd.read_csv(UPLOADS / "all_subtypes.v5.1.tsv", sep="\t").iterrows():
+for _, r in pd.read_csv(DISCOVERY_DIR / "all_subtypes.v5.1.tsv", sep="\t").iterrows():
     if r["sample_type"] == "tumor":         manifest[r["case"]] = "GBM"
     elif r["sample_type"] == "GTEx normal": manifest[r["case"]] = "Normal"
 
-rna_disc_df = pd.read_csv(UPLOADS / "rnaseq_washu_readcount.v4.0.tsv", sep="\t", low_memory=False)
+rna_disc_df = pd.read_csv(DISCOVERY_DIR / "rnaseq_washu_readcount.v4.0.tsv", sep="\t", low_memory=False)
 sc_disc = [c for c in rna_disc_df.columns if c in manifest]
 rna_disc = np.log1p(filter_to(rna_disc_df, "gene_name", pruned["rna"], sc_disc))
 
@@ -840,12 +842,12 @@ rna_disc_z = zscore(rna_disc)
 mean_gbm   = rna_disc_z.loc[:, [s for s in sc_disc if manifest[s]=="GBM"]].mean(axis=1)
 mean_norm  = rna_disc_z.loc[:, [s for s in sc_disc if manifest[s]=="Normal"]].mean(axis=1)
 
-pdac_rna = pd.read_csv(UPLOADS / "mRNA_RSEM_UQ_log2_Tumor.cct.csv", low_memory=False)
+pdac_rna = pd.read_csv(DISCOVERY_DIR / "mRNA_RSEM_UQ_log2_Tumor.cct.csv", low_memory=False)
 fc_p = pdac_rna.columns[0]; sc_p = detect(pdac_rna, exclude={fc_p})
 pdac_M = filter_to(pdac_rna, fc_p, pruned["rna"], sc_p)
 mean_pdac = zscore(pdac_M).mean(axis=1)
 
-ccrcc_M = load_by_ensg(UPLOADS / "CCRCC_RNAseq_gene_RSEM_coding_UQ_1500_log2_Tumor.txt", pruned["rna"])
+ccrcc_M = load_by_ensg(EXTERNAL_DIR / "CCRCC" / "CCRCC_RNAseq_gene_RSEM_coding_UQ_1500_log2_Tumor.txt", pruned["rna"])
 mean_ccrcc = zscore(ccrcc_M).mean(axis=1)
 
 heat = pd.DataFrame({

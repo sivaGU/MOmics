@@ -9,6 +9,8 @@ from docs import OVERVIEW, GUI_GUIDE, MODEL_ARCH
 
 #path to the files required 
 _HERE = Path(__file__).parent
+_DATA = _HERE / "data" / "discovery"
+_MODEL = _HERE / "models" / "MOmics_v11_locked_pipeline.pkl"
 
 # Page Configuration 
 st.set_page_config(page_title="MOmics", layout="wide", page_icon="🧬")
@@ -80,7 +82,7 @@ st.markdown("""
 
 @st.cache_resource
 def load_pipeline():
-    return joblib.load(_HERE / "MOmics_v11_locked_pipeline.pkl")
+    return joblib.load(_MODEL)
 
 pipe = load_pipeline()
 
@@ -398,13 +400,13 @@ def build_reference_table():
 @st.cache_data
 def load_demo_data():
     try:
-        rna_raw  = pd.read_csv(_HERE / "rnaseq_washu_readcount_v4.0.tsv",
+        rna_raw  = pd.read_csv(_DATA / "rnaseq_washu_readcount_v4.0.tsv",
                                sep="\t").set_index("gene_name")
-        prot_raw = pd.read_csv(_HERE / "proteome_mssm_per_gene_imputed_v4.0.tsv",
+        prot_raw = pd.read_csv(_DATA / "proteome_mssm_per_gene_imputed_v4.0.tsv",
                                sep="\t").set_index("gene")
-        met_raw  = pd.read_csv(_HERE / "metabolome_pnnl_v4.0.tsv",
+        met_raw  = pd.read_csv(_DATA / "metabolome_pnnl_v4.0.tsv",
                                sep="\t").set_index("Metabolite")
-        manifest = pd.read_csv(_HERE / "all_subtypes_v5.1.tsv", sep="\t")
+        manifest = pd.read_csv(_DATA / "all_subtypes_v5.1.tsv", sep="\t")
     except FileNotFoundError as e:
         st.error(f"Demo TSV not found: {e}. Ensure all TSV files are in the repo root.")
         st.stop()

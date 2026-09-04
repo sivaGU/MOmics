@@ -21,17 +21,13 @@ MOmics_GBM_Project/
 ├── README.md                         # Project overview and instructions
 
 ├── data/
-│   ├── discovery_cohort/
-│   │   ├── transcriptomics/
-│   │   ├── proteomics/
-│   │   └── metabolomics/
-│   ├── scalability_cohorts/
-│   │   ├── LUAD/
-│   │   ├── CCRCC/
-│   │   ├── BRCA/
-│   │   └── UCEC/
+│   ├── discovery/                    # GBM training and discovery inputs
 │   ├── external_validation/
-│   └── reference_data/
+│   │   ├── BRCA/
+│   │   ├── CCRCC/
+│   │   ├── CGGA/
+│   │   └── LUAD/
+│   └── reference/                    # Feature-selection references
 
 ├── results/
 │   ├── single_omics/
@@ -47,10 +43,7 @@ MOmics_GBM_Project/
 │   └── figures/
 
 ├── models/
-│   ├── transcriptomics_model.pkl
-│   ├── proteomics_model.pkl
-│   ├── metabolomics_model.pkl
-│   └── fusion_model.pkl
+│   └── MOmics_v11_locked_pipeline.pkl
 
 ├── features/
 │   ├── RNA_features.txt
@@ -63,9 +56,7 @@ MOmics_GBM_Project/
 │   └── validation_analysis.ipynb
 
 ├── gui_assets/
-│   ├── sample_input_files/
-│   ├── demo_data/
-│   └── screenshots/
+│   └── demo_data/
 
 ├── scripts/
 │   ├── run_training.py

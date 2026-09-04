@@ -18,7 +18,7 @@ library(STRINGdb)
 library(googlesheets4)
 
 # 1. Global settings
-data_dir <- "data"
+data_dir <- file.path("data", "discovery")
 results_dir <- "results"
 if(!dir.exists(results_dir)) dir.create(results_dir)
 

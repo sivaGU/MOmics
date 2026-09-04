@@ -4,7 +4,7 @@
 
 | File | Purpose |
 |---|---|
-| `MOmics_v11_locked_pipeline.pkl` | Single bundled artifact — load with `joblib.load(...)` and you have everything (sub-models, fusion model, feature lists, z-score parameters, threshold, symbol-to-ENSG map, isotonic calibrator). 1.96 MB. |
+| `models/MOmics_v11_locked_pipeline.pkl` | Single bundled artifact — load with `joblib.load(...)` and you have everything (sub-models, fusion model, feature lists, z-score parameters, threshold, symbol-to-ENSG map, isotonic calibrator). 1.96 MB. |
 | `MOmics_v11_inference.py` | GUI-ready inference helper. Drop into the Streamlit codebase, import `load_pipeline` and `score_sample`. |
 
 ## Training data
@@ -13,22 +13,22 @@ These three files were the only inputs to model training:
 
 | File (in `/mnt/user-data/uploads/`) | Role |
 |---|---|
-| `all_subtypes.v5.1.tsv` | Sample manifest. Defines tumor vs normal labels (109 samples: 99 GBM tumor + 10 GTEx-derived normal brain) |
-| `rnaseq_washu_readcount.v4.0.tsv` | Raw RNA-seq read counts. RNA sub-model trained on 99 tumor + 9 normal |
-| `proteome_mssm_per_gene_imputed.v4.0.tsv` | Log2 reference-intensity normalized protein abundances. Proteomic sub-model trained on 99 tumor + 10 normal |
-| `metabolome_pnnl.v4.0.tsv` | Log2 metabolite abundances. Metabolomic sub-model trained on 75 tumor + 7 normal |
+| `data/discovery/all_subtypes.v5.1.tsv` | Sample manifest. Defines tumor vs normal labels (109 samples: 99 GBM tumor + 10 GTEx-derived normal brain) |
+| `data/discovery/rnaseq_washu_readcount.v4.0.tsv` | Raw RNA-seq read counts. RNA sub-model trained on 99 tumor + 9 normal |
+| `data/discovery/proteome_mssm_per_gene_imputed.v4.0.tsv` | Log2 reference-intensity normalized protein abundances. Proteomic sub-model trained on 99 tumor + 10 normal |
+| `data/discovery/metabolome_pnnl.v4.0.tsv` | Log2 metabolite abundances. Metabolomic sub-model trained on 75 tumor + 7 normal |
 
 Plus one feature-selection input that defines the candidate panel (later pruned to 9 active features by gain importance):
 
 | File | Role |
 |---|---|
-| `diablo_multiomics_ranked_features_FDR_CLEAN.csv` | DIABLO-ranked 25 candidate features (12 RNA + 8 prot + 5 met) |
+| `data/reference/diablo_multiomics_ranked_features_FDR_CLEAN.csv` | DIABLO-ranked 25 candidate features (12 RNA + 8 prot + 5 met) |
 
 Everything else (CGGA, BRCA, ccRCC, LUAD, PDAC) was external validation only — never seen during training.
 
 ## Pipeline contents
 
-After `pipe = joblib.load("MOmics_v11_locked_pipeline.pkl")`, the dict has:
+After `pipe = joblib.load("models/MOmics_v11_locked_pipeline.pkl")`, the dict has:
 
 | Key | What it is |
 |---|---|
@@ -51,7 +51,7 @@ After `pipe = joblib.load("MOmics_v11_locked_pipeline.pkl")`, the dict has:
 ```python
 from MOmics_v11_inference import load_pipeline, score_sample, get_required_features
 
-pipe = load_pipeline("MOmics_v11_locked_pipeline.pkl")
+pipe = load_pipeline("models/MOmics_v11_locked_pipeline.pkl")
 
 # What features should the GUI ask for?
 print(get_required_features(pipe))

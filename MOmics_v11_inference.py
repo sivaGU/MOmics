@@ -7,7 +7,7 @@ Drop into the Streamlit GUI codebase and import `score_sample`.
 Usage:
     from MOmics_v11_inference import load_pipeline, score_sample
 
-    pipe = load_pipeline("MOmics_v11_locked_pipeline.pkl")
+    pipe = load_pipeline("models/MOmics_v11_locked_pipeline.pkl")
     result = score_sample(pipe, rna_dict={"BSN": 23.4, "PCLO": 18.1, ...},
                                 prot_dict={"CIT": -0.4, "PTPRT": -1.1, ...},
                                 met_dict={"hypotaurine": 8.2, "creatinine": 5.1, ...})
@@ -150,7 +150,7 @@ def get_calibration_info(pipe: dict) -> dict:
 
 if __name__ == "__main__":
     import sys
-    pkl_path = sys.argv[1] if len(sys.argv) > 1 else "MOmics_v11_locked_pipeline.pkl"
+    pkl_path = sys.argv[1] if len(sys.argv) > 1 else "models/MOmics_v11_locked_pipeline.pkl"
     p = load_pipeline(pkl_path)
 
     print("=== MOmics-ML v11 pipeline ===")
