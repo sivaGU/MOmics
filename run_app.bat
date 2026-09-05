@@ -1,0 +1,6 @@
+@echo off
+echo Installing dependencies...
+pip install -r requirements.txt
+echo Launching MOmics...
+streamlit run momics_app.py
+pause
