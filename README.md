@@ -8,10 +8,10 @@ A machine learning-driven multi-omics integration tool that identifies diagnosti
 
 The Streamlit app (`momics_app.py`) has four sections:
 
-- **Home** — project overview and quick access
-- **Documentation** — pipeline stages, feature alignment, and model architecture (served from `docs.py`)
-- **User Analysis** — manual entry or CSV upload of patient RNA/protein/metabolite values, scored against the locked pipeline with risk charts and a downloadable PDF report
-- **Demo Walkthrough** — a guided run through `gui_assets/demo_data/MOmics_GUI_demo_mixed.csv`
+- **Home** - project overview and quick access
+- **Documentation** - pipeline stages, feature alignment, and model architecture (served from `docs.py`)
+- **User Analysis** - manual entry or CSV upload of patient RNA/protein/metabolite values, scored against the locked pipeline with risk charts and a downloadable PDF report
+- **Demo Walkthrough** - a guided run through `gui_assets/demo_data/MOmics_GUI_demo_mixed.csv`
 
 ## Project Structure
 
@@ -83,9 +83,9 @@ Run `python verify_setup.py` to check your environment before launching. See `IN
 
 ## Data Sources
 
-- **Discovery cohort** — 109 CPTAC-processed samples (99 GBM tumor + 10 GTEx-derived normal brain) across RNA-seq, proteomics, and metabolomics. See `data/discovery/README.md` for a known gap: the metabolomics R script expects a `metabolome_sample_info.v4.0.tsv` file not yet checked into the repo.
-- **External validation** — BRCA, CCRCC, LUAD, and CGGA cohorts, never seen during training.
-- **Reference panel** — `data/reference/diablo_multiomics_ranked_features_FDR_CLEAN.csv`, the DIABLO-ranked 25-feature candidate panel (later pruned to 9 active features).
+- **Discovery cohort** - 109 CPTAC-processed samples (99 GBM tumor + 10 GTEx-derived normal brain) across RNA-seq, proteomics, and metabolomics. See `data/discovery/README.md` for a known gap: the metabolomics R script expects a `metabolome_sample_info.v4.0.tsv` file not yet checked into the repo.
+- **External validation** - BRCA, CCRCC, LUAD, and CGGA cohorts, never seen during training.
+- **Reference panel** - `data/reference/diablo_multiomics_ranked_features_FDR_CLEAN.csv`, the DIABLO-ranked 25-feature candidate panel (later pruned to 9 active features).
 
 ## Model
 
@@ -95,8 +95,8 @@ Run `python verify_setup.py` to check your environment before launching. See `IN
 
 ## Intended Use / Scope
 
-MOmics is trained and validated on CPTAC-processed multi-omic data, rank/z-score normalized within sample. Performance on data processed through other pipelines is not guaranteed. **For research use only — not for clinical diagnostic decisions.**
+MOmics is trained and validated on CPTAC-processed multi-omic data, rank/z-score normalized within sample. Performance on data processed through other pipelines is not guaranteed. **For research use only - not for clinical diagnostic decisions.**
 
 ## Contact
 
-Questions and bug reports: Dr. Sivanesan Dakshanamurthy — sd233@georgetown.edu
+Questions and bug reports: Dr. Sivanesan Dakshanamurthy - sd233@georgetown.edu
