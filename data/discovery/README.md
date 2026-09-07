@@ -4,4 +4,4 @@ Discovery-cohort inputs used to train the locked v11 pipeline (see `docs/gui_int
 
 `metabolome_sample_info.v4.0.tsv` is the metabolomics sample manifest read by `Single Omics & Integration/single_omics_metabolomics.R`.
 
-`../legacy/` holds earlier-normalization exports (`*.cct.csv`) that are not used by `ml_pipeline.py` or the locked model — kept for reference only.
+`mRNA_RSEM_UQ_log2_{Normal,Tumor}.cct.csv` and `proteomics_gene_level_MD_abundance_{normal,tumor}.cct.csv` are the PDAC external-validation inputs read directly from this folder by `ml_pipeline.py` (built via f-string, e.g. `f"mRNA_RSEM_UQ_log2_{kind}.cct.csv"` — not obvious from a filename grep, which is why these were briefly and incorrectly filed as unused legacy exports).

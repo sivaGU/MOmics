@@ -30,8 +30,7 @@ MOmics/
 ├── logo.png
 │
 ├── data/
-│   ├── discovery/                       # GBM training and discovery inputs (see data/discovery/README.md)
-│   │   └── legacy/                      # Earlier-normalization exports, not used by ml_pipeline.py
+│   ├── discovery/                       # GBM training and discovery inputs, plus PDAC external-validation inputs (see data/discovery/README.md)
 │   ├── external_validation/
 │   │   ├── BRCA/
 │   │   ├── CCRCC/
@@ -87,7 +86,7 @@ Run `python verify_setup.py` to check your environment before launching. See `IN
 ## Data Sources
 
 - **Discovery cohort** - 109 CPTAC-processed samples (99 GBM tumor + 10 GTEx-derived normal brain) across RNA-seq, proteomics, and metabolomics. `data/discovery/metabolome_sample_info.v4.0.tsv` provides the metabolomics sample manifest used by `Single Omics & Integration/single_omics_metabolomics.R`.
-- **External validation** - BRCA, CCRCC, LUAD, and CGGA cohorts, never seen during training.
+- **External validation** - BRCA, CCRCC, LUAD, CGGA, and PDAC cohorts, never seen during training. PDAC's inputs live directly in `data/discovery/` (read there by `ml_pipeline.py`) rather than under `data/external_validation/` like the other cohorts.
 - **Reference panel** - `data/reference/diablo_multiomics_ranked_features_FDR_CLEAN.csv`, the DIABLO-ranked 25-feature candidate panel (later pruned to 9 active features).
 
 ## Model
