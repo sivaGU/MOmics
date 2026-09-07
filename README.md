@@ -23,8 +23,8 @@ MOmics/
 ├── docs.py                              # Documentation strings shown in the app
 ├── single_omics_transcriptomics.R       # RNA differential analysis (DESeq2)
 ├── single_omics_metabolomics.R          # Metabolite differential analysis
-├── single_omics_proteomics.R            # Proteomics differential analysis (placeholder, not yet implemented)
-├── diabolo_integration.R                # Multi-omics DIABLO integration (placeholder, not yet implemented)
+├── single_omics_proteomics_DEG.R        # Proteomics differential expression (DESeq2)
+├── single_omics_proteomics_KEGG.R       # Proteomics KEGG pathway enrichment (consumes DEG output; kept as a separate script by design)
 ├── run_app.bat                          # Windows one-click launch
 ├── run_app.ps1                          # PowerShell launch
 ├── verify_setup.py                      # Environment + dependency check
@@ -42,6 +42,9 @@ MOmics/
 │   │   ├── CGGA/
 │   │   └── LUAD/
 │   └── reference/                       # Feature-selection references (DIABLO ranked panel)
+│
+├── multiomics_integration/
+│   └── diabolo_integration.R            # Multi-omics DIABLO integration + KEGG/MSEA overlap analysis
 │
 ├── models/
 │   └── MOmics_v11_locked_pipeline.pkl   # Bundled sub-models, fusion model, feature lists, calibrator
@@ -83,7 +86,7 @@ Run `python verify_setup.py` to check your environment before launching. See `IN
 
 ## Data Sources
 
-- **Discovery cohort** - 109 CPTAC-processed samples (99 GBM tumor + 10 GTEx-derived normal brain) across RNA-seq, proteomics, and metabolomics. See `data/discovery/README.md` for a known gap: the metabolomics R script expects a `metabolome_sample_info.v4.0.tsv` file not yet checked into the repo.
+- **Discovery cohort** - 109 CPTAC-processed samples (99 GBM tumor + 10 GTEx-derived normal brain) across RNA-seq, proteomics, and metabolomics. `data/discovery/metabolome_sample_info.v4.0.tsv` provides the metabolomics sample manifest used by `single_omics_metabolomics.R`.
 - **External validation** - BRCA, CCRCC, LUAD, and CGGA cohorts, never seen during training.
 - **Reference panel** - `data/reference/diablo_multiomics_ranked_features_FDR_CLEAN.csv`, the DIABLO-ranked 25-feature candidate panel (later pruned to 9 active features).
 
@@ -91,7 +94,7 @@ Run `python verify_setup.py` to check your environment before launching. See `IN
 
 `models/MOmics_v11_locked_pipeline.pkl` bundles the three per-layer sub-models, the fusion model, frozen z-score parameters, the Youden threshold, and an isotonic calibrator. See `docs/gui_integration_guide.md` for the full integration contract (input formats, missing-layer handling, and why raw vs. calibrated probabilities are used differently).
 
-`single_omics_proteomics.R` and `diabolo_integration.R` are placeholders for analyses described in the paper that aren't yet checked into this repo as standalone scripts.
+`single_omics_proteomics_DEG.R`, `single_omics_proteomics_KEGG.R`, and `multiomics_integration/diabolo_integration.R` still reference the original authors' local file paths (e.g. `~/Desktop/...`) rather than `data/discovery/`, so they need path updates before they'll run against this repo's data.
 
 ## Intended Use / Scope
 
