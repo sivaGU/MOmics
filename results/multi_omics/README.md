@@ -1,3 +1,3 @@
 # results/multi_omics/
 
-Placeholder for output of `omics_analysis/diabolo_integration.R`.
+Placeholder for output of `Single Omics & Integration/diabolo_integration.R`.
