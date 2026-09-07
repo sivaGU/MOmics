@@ -253,7 +253,7 @@ initial state without requiring a browser refresh.
 """
 
 MODEL_ARCH = """
-The MOmics predictive model was developed entirely within Python (Google Colab, version 3.10.12).
+The MOmics predictive model was developed entirely within Python 3.10.12.
 Data harmonization was performed to synchronize samples across the three omics layers
 (transcriptomics, proteomics, and metabolomics) from the CPTAC Discovery Cohort. Missing data values
 were inputted using a median strategy via the Scikit-learn library (version 1.6.1), followed by
