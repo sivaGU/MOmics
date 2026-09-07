@@ -6,10 +6,8 @@
 # before this will run end-to-end.
 
 
-# ----------------------------------------------------
 # Multi-omics Integration
-# ----------------------------------------------------
-# ----------------------------------------------------
+
 # SECTION 0: Setup and Environment
 # ----------------------------------------------------
 # Core R packages for data handling and plotting
