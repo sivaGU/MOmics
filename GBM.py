@@ -101,8 +101,29 @@ PROT_FEATURES = PRUNED["prot"]
 MET_FEATURES  = PRUNED["met"]
 ALL_FEATURES  = RNA_FEATURES + PROT_FEATURES + MET_FEATURES
 
+QC_COLS = ["Features Used", "RNA Features", "Protein Features", "Metabolomics Features",
+           "QC Status", "QC Notes"]
 SCORE_COLS = ["Prediction", "Risk Score (Raw)", "Risk Score (Calibrated)",
-              "Binary Call", "RNA Score", "Protein Score", "Metabolomics Score"]
+              "Binary Call", "RNA Score", "Protein Score", "Metabolomics Score",
+              "Sample ID"] + QC_COLS
+
+LAYER_FEATURES = {"rna": RNA_FEATURES, "prot": PROT_FEATURES, "met": MET_FEATURES}
+LAYER_NAMES = {"rna": "RNA", "prot": "Protein", "met": "Metabolomics"}
+# Symbols present in more than one layer (e.g. BSN, PCLO, PTPRT, CIT)
+SHARED_SYMBOLS = sorted(set(RNA_FEATURES) & set(PROT_FEATURES)
+                        | set(RNA_FEATURES) & set(MET_FEATURES)
+                        | set(PROT_FEATURES) & set(MET_FEATURES))
+
+RUO_NOTICE = (
+    "**Research use only.** Not for diagnostic or clinical decision-making. Scores come from a "
+    "model trained on CPTAC-3 GBM and GTEx normal brain data and are only interpretable for "
+    "inputs generated and processed the same way."
+)
+THRESHOLD_CAPTION = (
+    f"Model call = GBM-like when the raw fusion score is ≥ {THRESHOLD:.4f} (Youden threshold). "
+    "The calibrated probability is isotonic-mapped to the external validation cohort "
+    "(~4.6% GBM prevalence) and is not a risk estimate for an individual. Research use only."
+)
 
 # Indices the full 109-sample used for the demo for condensed and better representation
 DEMO_INDICES = [0, 13, 20, 104]
@@ -118,7 +139,7 @@ def _build_importance_df():
         feats = PRUNED[layer_key]
         model = SUB_MODELS[layer_key]
         for feat, imp in zip(feats, model.feature_importances_):
-            rows.append({"Biomarker": feat, "Influence Score": float(imp), "Layer": label})
+            rows.append({"Biomarker": f"{feat} ({label})", "Influence Score": float(imp), "Layer": label})
     return pd.DataFrame(rows).sort_values("Influence Score", ascending=False).reset_index(drop=True)
 
 importance_df_display = _build_importance_df()
@@ -187,29 +208,103 @@ def score_sample(rna_dict, prot_dict, met_dict):
     }
 
 
-def process_dataframe(df):
-    """Score a user-uploaded DataFrame. Columns are plain feature symbols."""
-    rna_set  = set(RNA_FEATURES)
-    prot_set = set(PROT_FEATURES)
-    met_set  = set(MET_FEATURES)
+def map_upload_columns(columns):
+    """Map uploaded columns to (layer, symbol). '<layer>_<SYMBOL>' always works;
+    a bare symbol only if it belongs to one layer. Returns mapping + rejected columns."""
+    mapping, ambiguous, unrecognized = {}, [], []
+    for c in columns:
+        name = str(c).strip()
+        target = None
+        for key, feats in LAYER_FEATURES.items():
+            if name.startswith(f"{key}_") and name[len(key) + 1:] in feats:
+                target = (key, name[len(key) + 1:])
+                break
+        if target is None:
+            if name in SHARED_SYMBOLS:
+                ambiguous.append(name)
+                continue
+            layers = [k for k, feats in LAYER_FEATURES.items() if name in feats]
+            if not layers:
+                unrecognized.append(name)
+                continue
+            target = (layers[0], name)
+        if target not in mapping.values():
+            mapping[c] = target
+    return mapping, ambiguous, unrecognized
+
+
+def process_dataframe(df, mapping=None):
+    """Score a user-uploaded DataFrame (layer-prefixed or unambiguous bare columns)."""
+    if mapping is None:
+        mapping, _, _ = map_upload_columns(df.columns)
+    numeric = df[list(mapping)].apply(pd.to_numeric, errors="coerce")
 
     results = []
-    for _, row in df.iterrows():
-        def layer_dict(feat_set):
-            d = {f: row[f] for f in feat_set if f in row.index and pd.notna(row[f])}
-            return d if d else None
+    for i in range(len(df)):
+        dicts = {"rna": {}, "prot": {}, "met": {}}
+        for col, (key, f) in mapping.items():
+            v = numeric.iloc[i][col]
+            if pd.notna(v):
+                dicts[key][f] = float(v)
+        layers = {k: (d if d else None) for k, d in dicts.items()}
 
-        result = score_sample(
-            rna_dict  = layer_dict(rna_set),
-            prot_dict = layer_dict(prot_set),
-            met_dict  = layer_dict(met_set),
-        )
-        for f in ALL_FEATURES:
-            result[f] = float(row[f]) if f in row.index and pd.notna(row.get(f)) else np.nan
+        result = score_sample(layers["rna"], layers["prot"], layers["met"])
+        result.update(input_qc(layers["rna"], layers["prot"], layers["met"]))
+        for key in ("rna", "prot", "met"):
+            for f in LAYER_FEATURES[key]:
+                result[f"{key}_{f}"] = dicts[key].get(f, np.nan)
         results.append(result)
 
     return pd.DataFrame(results)
 
+
+
+# Input QC (front end): report what was actually supplied for every prediction
+
+def _is_blank(v):
+    return v is None or (isinstance(v, (float, np.floating)) and np.isnan(v))
+
+
+def input_qc(rna_dict, prot_dict, met_dict):
+    """Count supplied features per layer and build QC fields shown with each prediction.
+    Mirrors score_sample's rules: a None / all-blank layer is 'not provided';
+    blanks inside a provided layer are filled with the training mean (z = 0)."""
+    used_total, notes, status = 0, [], "PASS"
+    out = {}
+    for key, d in (("rna", rna_dict), ("prot", prot_dict), ("met", met_dict)):
+        feats, name = LAYER_FEATURES[key], LAYER_NAMES[key]
+        n = len(feats)
+        k = 0 if d is None else sum(not _is_blank(d.get(f)) for f in feats)
+        out[f"{name} Features"] = f"{k}/{n}"
+        used_total += k
+        if k == 0:
+            notes.append(f"{name} layer not provided; scored without it.")
+            status = "REVIEW"
+        elif k < n:
+            notes.append(f"{n - k}/{n} {name} features missing; filled with the training mean (z = 0).")
+            status = "REVIEW"
+    if used_total == 0:
+        notes.append("No features supplied — this score reflects the training mean only. Do not interpret.")
+        status = "FAIL"
+    elif used_total < 0.5 * len(ALL_FEATURES):
+        notes.append("Fewer than half of the panel features were supplied; interpret with caution.")
+        status = "FAIL"
+    out.update({"Features Used": f"{used_total}/{len(ALL_FEATURES)}",
+                "QC Status": status, "QC Notes": " | ".join(notes)})
+    return out
+
+
+def render_qc(row):
+    head = (f"**QC: {row['QC Status']}** · Features used: **{row['Features Used']}** "
+            f"(RNA {row['RNA Features']} · Protein {row['Protein Features']} · "
+            f"Metabolomics {row['Metabolomics Features']})")
+    notes = [n for n in str(row.get("QC Notes", "")).split(" | ") if n]
+    body = head + ("\n\n" + "\n".join(f"- {n}" for n in notes) if notes else "")
+    {"PASS": st.success, "REVIEW": st.warning}.get(row["QC Status"], st.error)(body)
+
+
+def _call_label(binary):
+    return "GBM-like" if binary == "GBM" else "Non-GBM-like"
 
 
 # Visualizations
@@ -222,64 +317,73 @@ def _fmt(val):
 
 
 def render_risk_charts(results, mode="manual", key_prefix=""):
-    st.subheader("Prediction & Risk Assessment")
+    st.subheader("Model Output (research use only)")
+    call_colors = {"GBM-like": "#EF553B", "Non-GBM-like": "#00CC96"}
 
     if mode == "manual":
         row = results.iloc[0]
         c1, c2, c3, c4, c5, c6, c7 = st.columns(7)
-        c1.metric("Binary Call",            row["Binary Call"])
-        c2.metric("Prediction",             row["Prediction"])
-        c3.metric("Raw Fusion Score",       f"{row['Risk Score (Raw)']:.4f}")
-        c4.metric("Calibrated Probability", f"{row['Risk Score (Calibrated)']:.4f}")
-        c5.metric("RNA Score",              _fmt(row["RNA Score"]))
-        c6.metric("Protein Score",          _fmt(row["Protein Score"]))
-        c7.metric("Metabolomics Score",     _fmt(row["Metabolomics Score"]))
-        st.caption(
-            f"**Threshold:** {THRESHOLD:.4f} (Youden, operates on raw score). "
-            "Calibrated probability reflects ~4.6% GBM prevalence in the external validation set — "
-            "a raw score of ~0.97 maps to ~0.40 calibrated. This is expected, not a bug. "
-            "Use raw score for the binary GBM/Non-GBM call."
-        )
+        c1.metric("Model Call",             _call_label(row["Binary Call"]))
+        c2.metric("Raw Fusion Score",       f"{row['Risk Score (Raw)']:.4f}")
+        c3.metric("Calibrated Probability", f"{row['Risk Score (Calibrated)']:.4f}")
+        c4.metric("RNA Score",              _fmt(row["RNA Score"]))
+        c5.metric("Protein Score",          _fmt(row["Protein Score"]))
+        c6.metric("Metabolomics Score",     _fmt(row["Metabolomics Score"]))
+        c7.metric("Features Used",          row["Features Used"])
+        render_qc(row)
+        st.caption(THRESHOLD_CAPTION)
 
     else:
+        plot_df = results.copy()
+        plot_df["Model Call"] = plot_df["Binary Call"].map(_call_label)
+        plot_df["Sample"] = (plot_df["Sample ID"].astype(str) if "Sample ID" in plot_df
+                             else plot_df.index.astype(str))
+
+        q = plot_df["QC Status"].value_counts()
+        c1, c2, c3 = st.columns(3)
+        c1.metric("QC PASS",   int(q.get("PASS", 0)))
+        c2.metric("QC REVIEW", int(q.get("REVIEW", 0)))
+        c3.metric("QC FAIL",   int(q.get("FAIL", 0)))
+        if q.get("REVIEW", 0) or q.get("FAIL", 0):
+            st.warning("Some samples have missing features or layers. Check the Features Used and "
+                       "QC Notes columns before interpreting their scores.")
+
         col1, col2 = st.columns(2)
         with col1:
-            fig = px.histogram(results, x="Risk Score (Raw)", color="Prediction",
+            fig = px.histogram(plot_df, x="Risk Score (Raw)", color="Model Call",
                                title="Raw Fusion Score Distribution",
-                               color_discrete_map={"High Risk": "#EF553B", "Low Risk": "#00CC96"},
-                               nbins=20)
+                               color_discrete_map=call_colors, nbins=20)
             fig.add_vline(x=THRESHOLD, line_dash="dash", line_color="gray",
                           annotation_text=f"Youden ({THRESHOLD:.3f})")
-            fig.update_layout(xaxis_title="Raw Score", yaxis_title="Number of Patients")
+            fig.update_layout(xaxis_title="Raw Score", yaxis_title="Number of Samples")
             st.plotly_chart(fig, use_container_width=True, key=f"{key_prefix}_hist")
         with col2:
-            rs = results.sort_values("Risk Score (Raw)", ascending=False).reset_index(drop=True)
-            rs["Patient_ID"] = rs.index
-            fig2 = px.bar(rs, x="Patient_ID", y="Risk Score (Raw)", color="Prediction",
-                          title="Individual Patient Raw Scores",
-                          color_discrete_map={"High Risk": "#EF553B", "Low Risk": "#00CC96"})
+            rs = plot_df.sort_values("Risk Score (Raw)", ascending=False)
+            fig2 = px.bar(rs, x="Sample", y="Risk Score (Raw)", color="Model Call",
+                          title="Raw Fusion Score by Sample", color_discrete_map=call_colors,
+                          hover_data=["Features Used", "QC Status"])
             fig2.add_hline(y=THRESHOLD, line_dash="dash", line_color="gray",
                            annotation_text=f"Threshold ({THRESHOLD:.3f})")
             fig2.update_layout(yaxis_range=[0, 1])
             st.plotly_chart(fig2, use_container_width=True, key=f"{key_prefix}_bar")
 
         st.divider()
-        st.subheader("Risk Score Table")
-        display = results[["Prediction", "Binary Call",
-                            "Risk Score (Raw)", "Risk Score (Calibrated)",
-                            "RNA Score", "Protein Score", "Metabolomics Score"]].copy()
-        display.insert(0, "Patient ID", display.index)
+        st.subheader("Results Table")
+        display = plot_df[["Sample", "Model Call", "Risk Score (Raw)", "Risk Score (Calibrated)",
+                           "RNA Score", "Protein Score", "Metabolomics Score",
+                           "Features Used", "QC Status", "QC Notes"]].copy()
         for col in ["Risk Score (Raw)", "Risk Score (Calibrated)",
                     "RNA Score", "Protein Score", "Metabolomics Score"]:
             display[col] = display[col].apply(
                 lambda x: f"{x:.4f}" if pd.notna(x) and x is not None else "N/A"
             )
         st.dataframe(display, use_container_width=True, hide_index=True)
-        st.caption(
-            f"Threshold = {THRESHOLD:.4f} (Youden, raw score). "
-            "Calibrated score is isotonic-mapped to the external validation set (~4.6% GBM prevalence). "
-            "Use raw score for the binary call."
-        )
+        out = results.copy()
+        out.insert(0, "Intended Use", "Research use only - not for diagnostic use")
+        st.download_button("Download results (CSV)", out.to_csv(index=False).encode("utf-8"),
+                           file_name="MOmics_results_research_use_only.csv", mime="text/csv",
+                           key=f"{key_prefix}_dl")
+        st.caption(THRESHOLD_CAPTION)
 
 
 def render_dashboard(results, mode="manual", key_prefix="", patient_labels=None):
@@ -291,27 +395,28 @@ def render_dashboard(results, mode="manual", key_prefix="", patient_labels=None)
         c1, c2, c3, c4 = st.columns(4)
         total = len(results)
         gbm_n = (results["Binary Call"] == "GBM").sum()
-        c1.metric("Total Patients",  total)
-        c2.metric("GBM Calls",       f"{gbm_n} ({gbm_n/total:.1%})")
+        c1.metric("Total Samples",   total)
+        c2.metric("GBM-like Calls",  f"{gbm_n} ({gbm_n/total:.1%})")
         c3.metric("Mean Raw Score",  f"{results['Risk Score (Raw)'].mean():.4f}")
         c4.metric("Median Raw Score",f"{results['Risk Score (Raw)'].median():.4f}")
 
     st.divider()
-    st.subheader("Individual Patient Analysis")
-    fmt = (lambda i: f"Patient {i} — {patient_labels[i]}"
-           if patient_labels and i < len(patient_labels) else f"Patient {i}")
-    selected = st.selectbox("Select Patient Record", results.index,
+    st.subheader("Individual Sample Analysis")
+    fmt = (lambda i: f"Sample {i} — {patient_labels[i]}"
+           if patient_labels and i < len(patient_labels) else f"Sample {i}")
+    selected = st.selectbox("Select Sample", results.index,
                             format_func=fmt, key=f"{key_prefix}_select")
     row = results.iloc[selected]
 
     c1, c2, c3, c4, c5, c6, c7 = st.columns(7)
-    c1.metric("Binary Call",            row["Binary Call"])
-    c2.metric("Prediction",             row["Prediction"])
-    c3.metric("Raw Score",              f"{row['Risk Score (Raw)']:.4f}")
-    c4.metric("Calibrated",             f"{row['Risk Score (Calibrated)']:.4f}")
-    c5.metric("RNA Score",              _fmt(row["RNA Score"]))
-    c6.metric("Protein Score",          _fmt(row["Protein Score"]))
-    c7.metric("Metabolomics Score",     _fmt(row["Metabolomics Score"]))
+    c1.metric("Model Call",             _call_label(row["Binary Call"]))
+    c2.metric("Raw Score",              f"{row['Risk Score (Raw)']:.4f}")
+    c3.metric("Calibrated",             f"{row['Risk Score (Calibrated)']:.4f}")
+    c4.metric("RNA Score",              _fmt(row["RNA Score"]))
+    c5.metric("Protein Score",          _fmt(row["Protein Score"]))
+    c6.metric("Metabolomics Score",     _fmt(row["Metabolomics Score"]))
+    c7.metric("Features Used",          row["Features Used"])
+    render_qc(row)
 
     st.divider()
     col_l, col_r = st.columns([1, 2])
@@ -331,7 +436,7 @@ def render_dashboard(results, mode="manual", key_prefix="", patient_labels=None)
         st.plotly_chart(fig_radar, use_container_width=True, key=f"{key_prefix}_radar_{selected}")
 
     with col_r:
-        st.write(f"### Biomarker Input Values (Patient {selected})")
+        st.write(f"### Biomarker Input Values (Sample {selected})")
         marker_cols = [c for c in results.columns if c not in SCORE_COLS]
         marker_vals = row[marker_cols].astype(float).dropna().sort_values(ascending=False)
         fig_top = px.bar(x=marker_vals.values, y=marker_vals.index, orientation="h",
@@ -343,11 +448,11 @@ def render_dashboard(results, mode="manual", key_prefix="", patient_labels=None)
     col_imp1, col_imp2 = st.columns(2)
 
     with col_imp1:
-        st.write("#### Patient's Biomarker Values")
+        st.write("#### Sample Biomarker Values")
         patient_vals = row[marker_cols].astype(float).dropna().sort_values(ascending=False)
         fig_pt = px.bar(x=patient_vals.values, y=patient_vals.index, orientation="h",
                         color=patient_vals.values, color_continuous_scale="Viridis",
-                        title=f"Input Values — Patient {selected}")
+                        title=f"Input Values — Sample {selected}")
         fig_pt.update_layout(yaxis={"categoryorder": "total ascending"})
         st.plotly_chart(fig_pt, use_container_width=True, key=f"{key_prefix}_ptop_{selected}")
 
@@ -361,7 +466,7 @@ def render_dashboard(results, mode="manual", key_prefix="", patient_labels=None)
         fig_gi.update_layout(yaxis={"categoryorder": "total ascending"})
         st.plotly_chart(fig_gi, use_container_width=True, key=f"{key_prefix}_gimp_{selected}")
 
-    with st.expander("View All Biomarker Values for This Patient"):
+    with st.expander("View All Biomarker Values for This Sample"):
         all_markers = row[marker_cols].to_frame(name="Value").reset_index()
         all_markers.columns = ["Biomarker", "Value"]
         all_markers = all_markers.sort_values("Value", ascending=False)
@@ -457,11 +562,9 @@ def process_demo_dataframe(df):
         prot_dict = {f: row[f"prot_{f}"] for f in PROT_FEATURES if pd.notna(row.get(f"prot_{f}"))}
         met_dict  = {f: row[f"met_{f}"]  for f in MET_FEATURES  if pd.notna(row.get(f"met_{f}"))}
 
-        result = score_sample(
-            rna_dict  if rna_dict  else None,
-            prot_dict if prot_dict else None,
-            met_dict  if met_dict  else None,
-        )
+        rna_dict, prot_dict, met_dict = (rna_dict or None), (prot_dict or None), (met_dict or None)
+        result = score_sample(rna_dict, prot_dict, met_dict)
+        result.update(input_qc(rna_dict, prot_dict, met_dict))
         for f in RNA_FEATURES:
             result[f"rna_{f}"]  = row.get(f"rna_{f}",  np.nan)
         for f in PROT_FEATURES:
@@ -477,6 +580,7 @@ def process_demo_dataframe(df):
 # Sidebar
 
 st.sidebar.title("MOmics")
+st.sidebar.markdown("**Research use only**")
 st.sidebar.markdown("---")
 page = st.sidebar.radio("Navigation", ["Home", "Documentation", "User Analysis", "Demo Walkthrough"])
 
@@ -489,7 +593,8 @@ st.sidebar.markdown(f"Metabolomics features: {len(MET_FEATURES)}")
 st.sidebar.markdown(f"")
 st.sidebar.markdown(f"")
 
-st.title("MOmics | GBM Clinical Diagnostic Suite")
+st.title("MOmics | GBM Multi-Omics Research Tool")
+st.warning(RUO_NOTICE, icon="⚠️")
 
 
 
@@ -503,7 +608,19 @@ if page == "Home":
     except Exception:
         st.info("Logo image not found. Please ensure 'logo.png' is in the root directory.")
     st.markdown("<h1 style='text-align: center;'>MOmics</h1>", unsafe_allow_html=True)
-    st.markdown("<h3 style='text-align: center;'>GBM Clinical Diagnostic Suite</h3>", unsafe_allow_html=True)
+    st.markdown("<h3 style='text-align: center;'>GBM Multi-Omics Research Tool</h3>", unsafe_allow_html=True)
+    st.markdown("---")
+    st.markdown(f"""
+**Intended use.** MOmics scores RNA, protein and metabolite profiles with a model trained on
+CPTAC-3 GBM tumours and GTEx normal brain. It returns model scores for research purposes, not
+diagnoses, and has not been validated for clinical use.
+
+- Inputs must be generated and processed like the CPTAC-3 discovery data (RNA raw read counts;
+  protein and metabolite log2 abundance). Values from other platforms or normalisations are
+  z-scored against CPTAC-3 parameters and may produce meaningless scores.
+- Missing features are filled with the training mean. Every prediction reports how many of the
+  {len(ALL_FEATURES)} panel features were actually supplied, and is flagged when any are missing.
+""")
     st.markdown("---")
     st.markdown('<div style="font-size: 28px; font-weight: 600; margin-bottom: 10px;">Contact Information</div>', unsafe_allow_html=True)
     st.markdown(
@@ -544,18 +661,20 @@ elif page == "Documentation":
 
 elif page == "User Analysis":
     st.header("User Analysis")
-    analysis_tabs = st.tabs(["Manual Patient Entry", "Bulk Data Upload", "Example Analysis"])
+    analysis_tabs = st.tabs(["Manual Entry", "Bulk Data Upload", "Synthetic Example"])
 
     # Manual entry section
     with analysis_tabs[0]:
-        st.subheader("Manual Patient Entry")
+        st.subheader("Manual Sample Entry")
         st.info(
-            "**RNA:** enter raw read counts (log1p applied internally). "
-            "Do not pre-normalize. Leave a field at 0.0 to fill with training mean. "
-            "Uncheck a layer to exclude it — the fusion model handles missing layers natively."
+            "**RNA:** raw read counts (log1p applied internally; do not pre-normalize). "
+            "**Protein / Metabolomics:** log2 abundance as in CPTAC-3. "
+            "Leave a field **blank** if you don't have it (enter 0 only for a true zero). "
+            "Blanks are filled with the training mean and reported with the result. "
+            "Uncheck a layer to exclude it entirely."
         )
 
-        user_inputs = {}
+        user_inputs = {"rna": {}, "prot": {}, "met": {}}
         col_tog1, col_tog2, col_tog3 = st.columns(3)
         rna_enabled  = col_tog1.checkbox("Include RNA layer",          value=True, key="tog_rna")
         prot_enabled = col_tog2.checkbox("Include Protein layer",      value=True, key="tog_prot")
@@ -566,8 +685,8 @@ elif page == "User Analysis":
         rna_cols = st.columns(3)
         for i, feat in enumerate(RNA_FEATURES):
             with rna_cols[i % 3]:
-                user_inputs[feat] = st.number_input(
-                    feat, value=None, placeholder="leave blank = training mean",
+                user_inputs["rna"][feat] = st.number_input(
+                    feat, value=None, placeholder="blank = missing",
                     key=f"rna_{feat}",
                     help=f"ENSG: {SYMBOL_TO_ENSG.get(feat, '—')}. Raw read count.",
                     disabled=not rna_enabled
@@ -578,8 +697,8 @@ elif page == "User Analysis":
         prot_cols = st.columns(4)
         for i, feat in enumerate(PROT_FEATURES):
             with prot_cols[i % 4]:
-                user_inputs[feat] = st.number_input(
-                    feat, value=None, placeholder="leave blank = training mean",
+                user_inputs["prot"][feat] = st.number_input(
+                    feat, value=None, placeholder="blank = missing",
                     key=f"prot_{feat}",
                     help=f"ENSG: {SYMBOL_TO_ENSG.get(feat, '—')}. Log2 CPTAC abundance.",
                     disabled=not prot_enabled
@@ -590,19 +709,29 @@ elif page == "User Analysis":
         met_cols = st.columns(3)
         for i, feat in enumerate(MET_FEATURES):
             with met_cols[i % 3]:
-                user_inputs[feat] = st.number_input(
-                    feat, value=None, placeholder="leave blank = training mean",
+                user_inputs["met"][feat] = st.number_input(
+                    feat, value=None, placeholder="blank = missing",
                     key=f"met_{feat}",
                     disabled=not met_enabled
                 )
 
-        if st.button("Analyze Single Patient", key="btn_manual", type="primary"):
-            rna_d  = {f: user_inputs[f] for f in RNA_FEATURES}  if rna_enabled  else None
-            prot_d = {f: user_inputs[f] for f in PROT_FEATURES} if prot_enabled else None
-            met_d  = {f: user_inputs[f] for f in MET_FEATURES}  if met_enabled  else None
+        enabled = {"rna": rna_enabled, "prot": prot_enabled, "met": met_enabled}
+        supplied = {k: (sum(v is not None for v in user_inputs[k].values()) if enabled[k] else 0)
+                    for k in user_inputs}
+        st.caption("Supplied: " + " · ".join(
+            f"{LAYER_NAMES[k]} {supplied[k]}/{len(LAYER_FEATURES[k])}" for k in user_inputs)
+            + f" · Total {sum(supplied.values())}/{len(ALL_FEATURES)}")
+
+        if st.button("Score Sample", key="btn_manual", type="primary"):
+            rna_d  = user_inputs["rna"]  if rna_enabled  else None
+            prot_d = user_inputs["prot"] if prot_enabled else None
+            met_d  = user_inputs["met"]  if met_enabled  else None
             result = score_sample(rna_d, prot_d, met_d)
-            for f in ALL_FEATURES:
-                result[f] = user_inputs.get(f)
+            result.update(input_qc(rna_d, prot_d, met_d))
+            for key in ("rna", "prot", "met"):
+                for f in LAYER_FEATURES[key]:
+                    v = user_inputs[key].get(f) if enabled[key] else None
+                    result[f"{key}_{f}"] = np.nan if v is None else float(v)
             m_results = pd.DataFrame([result])
             st.success("Analysis Complete!")
             st.divider()
@@ -614,75 +743,94 @@ elif page == "User Analysis":
         col_t1, col_t2 = st.columns([2, 1])
         with col_t2:
             st.write("### Download Template")
-            layer_note = {f: ("raw counts" if f in RNA_FEATURES else "log2 abundance") for f in ALL_FEATURES}
-            template_csv = pd.DataFrame([layer_note]).to_csv(index=False).encode("utf-8")
+            template_cols = ["Sample_ID"] + [f"{k}_{f}" for k in ("rna", "prot", "met")
+                                             for f in LAYER_FEATURES[k]]
+            template_csv = pd.DataFrame(columns=template_cols).to_csv(index=False).encode("utf-8")
             st.download_button(
                 label="Download CSV Template",
                 data=template_csv,
-                file_name="MOmics_v11_Patient_Template.csv",
+                file_name="MOmics_v11_Template.csv",
                 mime="text/csv",
-                help="Row 1 shows expected value type. Replace it with patient data before uploading."
+            )
+            st.caption(
+                "Columns: `Sample_ID`, then `<layer>_<SYMBOL>` (e.g. `rna_BSN`, `prot_BSN`). "
+                "Units: `rna_` = raw read counts; `prot_` / `met_` = log2 abundance. "
+                f"Shared symbols ({', '.join(SHARED_SYMBOLS)}) must carry the layer prefix."
             )
         with col_t1:
-            st.write("### Upload Patient Data")
-            uploaded_file = st.file_uploader(
-                "Upload patient CSV", type="csv",
-                help="Columns = gene symbols. RNA = raw counts, Prot/Met = log2 abundance."
-            )
+            st.write("### Upload Sample Data")
+            uploaded_file = st.file_uploader("Upload CSV", type="csv")
 
         if uploaded_file is not None:
             try:
                 raw_df = pd.read_csv(uploaded_file)
-                raw_df = raw_df.drop(
-                    columns=[c for c in raw_df.columns if c in ("Sample ID", "Sample_ID")],
-                    errors="ignore"
-                )
-                st.success(f"File uploaded — {len(raw_df)} patient(s) found.")
-                b_results = process_dataframe(raw_df)
-                st.divider()
-                st.subheader("Analysis Results")
-                render_dashboard(b_results, mode="bulk", key_prefix="blk")
+                id_col = next((c for c in raw_df.columns if c in ("Sample ID", "Sample_ID")), None)
+                ids = (raw_df[id_col].astype(str).tolist() if id_col
+                       else [f"Sample {i + 1}" for i in range(len(raw_df))])
+                feat_df = raw_df.drop(columns=[id_col]) if id_col else raw_df
+                mapping, ambiguous, unrecognized = map_upload_columns(feat_df.columns)
+
+                st.success(f"{len(raw_df)} sample(s) read. Recognised {len(mapping)} of "
+                           f"{len(ALL_FEATURES)} panel columns.")
+                if ambiguous:
+                    st.error("Ignored columns that exist in more than one layer — add the "
+                             f"`rna_` / `prot_` / `met_` prefix: {', '.join(ambiguous)}")
+                if unrecognized:
+                    st.warning(f"Ignored {len(unrecognized)} unrecognised column(s): "
+                               f"{', '.join(unrecognized[:15])}{'...' if len(unrecognized) > 15 else ''}")
+                if len(mapping) < len(ALL_FEATURES):
+                    st.warning(f"{len(ALL_FEATURES) - len(mapping)} panel feature(s) are absent from "
+                               "the file and will be filled with the training mean for every sample.")
+
+                if not mapping:
+                    st.error("No panel features recognised; nothing was scored.")
+                else:
+                    b_results = process_dataframe(feat_df, mapping)
+                    b_results.insert(0, "Sample ID", ids)
+                    st.divider()
+                    st.subheader("Analysis Results")
+                    render_dashboard(b_results, mode="bulk", key_prefix="blk", patient_labels=ids)
             except Exception as e:
                 st.error(f"Error processing file: {e}")
-                st.info("Ensure columns match feature symbols in the template.")
+                st.info("Ensure columns match the template.")
 
     # Example section
     with analysis_tabs[2]:
-        st.subheader("Example Analysis")
-        st.write(
-            "Uses two preloaded samples and runs the model using values from those samples"
-            "one with a high-risk GBM profile and one with a low-risk profile. "
-            "No file upload required."
+        st.subheader("Synthetic Example")
+        st.warning(
+            "These two profiles are **synthetic**, not real samples: every feature is set +1.5 SD (A) "
+            "or −0.5 SD (B) from the training mean, plus small noise. They only demonstrate the "
+            "interface. See Demo Walkthrough for real CPTAC-3 / GTEx samples."
         )
 
         def _generate_mock_patients():
             rng = np.random.default_rng(42)
             rows = []
             for label, rna_z, prot_z, met_z in [
-                ("Patient A (High Risk)", +1.5, +1.5, +1.5),
-                ("Patient B (Low Risk)",  -0.5, -0.5, -0.5),
+                ("Synthetic A (+1.5 SD)", +1.5, +1.5, +1.5),
+                ("Synthetic B (−0.5 SD)", -0.5, -0.5, -0.5),
             ]:
                 row = {"Sample ID": label}
                 for f in RNA_FEATURES:
                     mean = ZSCORE_PARAMS["rna"]["mean"].get(f, 0.0)
                     std  = ZSCORE_PARAMS["rna"]["std"].get(f, 1.0) or 1.0
                     log1p_val = mean + rna_z * std + rng.normal(0, 0.05)
-                    row[f] = float(np.expm1(max(log1p_val, 0.0)))
+                    row[f"rna_{f}"] = float(np.expm1(max(log1p_val, 0.0)))
                 for f in PROT_FEATURES:
                     mean = ZSCORE_PARAMS["prot"]["mean"].get(f, 0.0)
                     std  = ZSCORE_PARAMS["prot"]["std"].get(f, 1.0) or 1.0
-                    row[f] = float(mean + prot_z * std + rng.normal(0, 0.05))
+                    row[f"prot_{f}"] = float(mean + prot_z * std + rng.normal(0, 0.05))
                 for f in MET_FEATURES:
                     mean = ZSCORE_PARAMS["met"]["mean"].get(f, 0.0)
                     std  = ZSCORE_PARAMS["met"]["std"].get(f, 1.0) or 1.0
-                    row[f] = float(mean + met_z * std + rng.normal(0, 0.05))
+                    row[f"met_{f}"] = float(mean + met_z * std + rng.normal(0, 0.05))
                 rows.append(row)
             return pd.DataFrame(rows)
 
         col_ex1, col_ex2 = st.columns([1, 2])
         with col_ex1:
-            st.markdown("**Patient A:** High-risk profile")
-            st.markdown("**Patient B:** Low-risk profile")
+            st.markdown("**Synthetic A:** all features +1.5 SD")
+            st.markdown("**Synthetic B:** all features −0.5 SD")
             st.markdown("**RNA:** raw read counts | **Prot/Met:** log2 abundance")
 
             if st.button("Run Example Analysis", type="primary", key="btn_example"):
@@ -703,7 +851,7 @@ elif page == "User Analysis":
                     st.rerun()
 
         with col_ex2:
-            with st.expander("Preview patient input data"):
+            with st.expander("Preview synthetic input data"):
                 try:
                     preview = _generate_mock_patients()
                     st.dataframe(preview, use_container_width=True, hide_index=True)
@@ -727,12 +875,14 @@ elif page == "Demo Walkthrough":
     st.markdown("""
     <div class="demo-box">
     <h3>Welcome to the Demo Workspace</h3>
-    <p>This workspace uses real samples from the v11 training cohort — the same data the model was built on.</p>
+    <p>This workspace uses real samples from the v11 training cohort — the same data the model was built on.
+    Correct calls here show that the interface runs end to end, <strong>not</strong> how well the model
+    performs on new data.</p>
     <ul>
         <li><strong>3 GBM tumor samples</strong> (CPTAC-3 cohort, C3L/C3N IDs) — all 3 layers available</li>
         <li><strong>1 GTEx normal brain sample</strong> (PT- ID) — RNA + Protein only (no metabolomics)</li>
         <li>Full z-score → sub-model → fusion → isotonic calibration pipeline</li>
-        <li>Raw score (for binary call) and calibrated probability (for clinical context) both shown</li>
+        <li>Raw score (for the model call) and calibrated probability both shown, with features used and QC status</li>
     </ul>
     </div>
     """, unsafe_allow_html=True)
@@ -753,10 +903,10 @@ elif page == "Demo Walkthrough":
     if demo_mode == "Try with Sample Patients":
         st.subheader("Interactive Analysis with Sample Data")
         st.markdown("""<div class="demo-box demo-success">
-        <h4>Real Patient Dataset Loaded</h4>
+        <h4>Real Training Samples Loaded</h4>
         <p><strong>3 GBM tumor samples</strong> (CPTAC-3, all 3 layers) and
         <strong>1 GTEx normal brain sample</strong> (RNA + Protein only, no metabolomics).
-        Click "Analyze Sample Patients" to run the full v11 diagnostic pipeline.</p>
+        Click "Analyze Sample Patients" to run the full v11 pipeline.</p>
         </div>""", unsafe_allow_html=True)
 
         with st.expander("Preview Sample Patient Data"):
@@ -777,7 +927,7 @@ elif page == "Demo Walkthrough":
                 (tl == "GBM") == (bc == "GBM")
                 for tl, bc in zip(demo_true_labels, res["Binary Call"].tolist())
             )
-            st.info(f"Model concordance with true labels: **{concordant}/{len(demo_true_labels)}** correct")
+            st.info(f"Agreement with true labels: **{concordant}/{len(demo_true_labels)}** (training samples — not a performance estimate)")
             render_dashboard(res, mode="bulk", key_prefix="demo", patient_labels=demo_labels)
 
     #  GUIDED TUTORIAL
