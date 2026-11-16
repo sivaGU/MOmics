@@ -18,15 +18,29 @@ library(KEGGREST)
 library(stringr)
 library(mixOmics)
 
-data_dir <- file.path("data", "discovery")
+# clusterProfiler/mixOmics load other packages that mask dplyr::select; force dplyr's version
+select <- dplyr::select
+
+# Folder that holds the two metabolomics .tsv files.
+data_dir <- "Data"
 results_dir <- "results"
 
 if(!dir.exists(results_dir)) dir.create(results_dir)
 
+# Find the files whether their names use dots (v4.0) or underscores (v4_0)
+expr_file <- list.files(data_dir, pattern = "^metabolome_pnnl.*\\.tsv$", full.names = TRUE)[1]
+meta_file <- list.files(data_dir, pattern = "^metabolome_sample_info.*\\.tsv$", full.names = TRUE)[1]
+if(is.na(expr_file) | is.na(meta_file)) {
+  stop("Could not find the metabolomics files in: ", normalizePath(data_dir, mustWork = FALSE),
+       "\nFiles R can see there: ", paste(list.files(data_dir), collapse = ", "))
+}
+cat("Expression file:", expr_file, "\n")
+cat("Sample info file:", meta_file, "\n")
+
 # 1. Import data sets for analysis 
 
-expr_raw <- read_tsv(file.path(data_dir,"metabolome_pnnl.v4.0.tsv"), show_col_types = FALSE)
-metadata <- read_tsv(file.path(data_dir,"metabolome_sample_info.v4.0.tsv"), show_col_types = FALSE)
+expr_raw <- read_tsv(expr_file, show_col_types = FALSE)
+metadata <- read_tsv(meta_file, show_col_types = FALSE)
 
 # Remove unknown metabolites and duplicates
 expr_clean <- expr_raw %>%
@@ -49,11 +63,20 @@ present_count <- rowSums(expr_mat > 0, na.rm=TRUE)
 
 expr_mat <- expr_mat[present_count >= (ncol(expr_mat)*0.8), ]
 
-# Imputation + log transform
-min_val <- min(expr_mat[expr_mat > 0], na.rm=TRUE) / 2
+# Report counts for the Methods (feature and sample numbers after filtering)
+cat("Features in raw file:", nrow(expr_raw), "\n")
+cat("Features after unknown/duplicate removal:", nrow(expr_clean), "\n")
+cat("Features after 80% presence filter:", nrow(expr_mat), "\n")
+print(table(metadata$tumor_normal))
+
+# Imputation (NO second log transform)
+# The PNNL values are already log2-transformed at the source (range ~11.6 to ~27.4),
+# so they are used as is. Half-minimum imputation on the log2 scale is
+# (minimum observed value - 1), which equals half the minimum intensity on the raw scale.
+min_val <- min(expr_mat[expr_mat > 0], na.rm=TRUE) - 1
 expr_mat[expr_mat == 0 | is.na(expr_mat)] <- min_val
 
-expr_log2 <- log2(expr_mat)
+expr_log2 <- expr_mat   # already log2; no further transformation
 
 # 3. Create Principal Component Analysis (PCA)
 
@@ -229,34 +252,73 @@ if(!is.null(kegg_enrich)){
   print(kegg_plot)
   ggsave(file.path(results_dir, "Fig4_KEGG_Pathways.png"), width = 8, height = 5, dpi = 300)
 }
-# Export Results to google sheets
-library(googlesheets4)
 
-# Authenticate your Google account (will open browser)
-gs4_auth()
+# 8. Prepare tables (same columns as the original script)
 
-# Prepare tables
+# Significant tab: raw P < 0.05 (the KEGG input list)
 sig_table <- results_with_ids %>%
   filter(P.Value < 0.05) %>%
-  select(Metabolite, logFC, P.Value, adj.P.Val, VIP)
+  dplyr::select(Metabolite, logFC, P.Value, adj.P.Val, VIP)
 
 up_table <- results_with_ids %>%
   filter(Status == "Upregulated") %>%
-  select(Metabolite, logFC, VIP)
+  dplyr::select(Metabolite, logFC, VIP)
 
 down_table <- results_with_ids %>%
   filter(Status == "Downregulated") %>%
-  select(Metabolite, logFC, VIP)
+  dplyr::select(Metabolite, logFC, VIP)
 
+# Biomarkers tab: top 10 by VIP
 top10_table <- top10_biomarkers %>%
-  select(Metabolite, VIP, logFC, P.Value)
+  dplyr::select(Metabolite, VIP, logFC, P.Value)
 
+# KEGG pathways tab
 kegg_table <- as.data.frame(kegg_enrich) %>%
   mutate(Metabolite_Names = sapply(geneID, function(ids) {
     paste(results_with_ids$Metabolite[match(unlist(strsplit(ids, "/")), results_with_ids$KEGG_ID)],
           collapse = ", ")
   })) %>%
-  select(Description, pvalue, Count, Metabolite_Names)
+  dplyr::select(Description, pvalue, Count, Metabolite_Names)
+
+# Supplement tables (same columns as Supplementary Tables S4.a and S4.b)
+s4a_table <- results_df %>%
+  arrange(desc(Status != "Non-significant"), adj.P.Val) %>%
+  dplyr::select(Metabolite, logFC, AveExpr, t, P.Value, adj.P.Val, B, VIP, Status)
+
+s4b_table <- results_df %>%
+  filter(Status != "Non-significant") %>%
+  arrange(desc(logFC)) %>%
+  dplyr::select(Metabolite, logFC, AveExpr, t, P.Value, adj.P.Val, B, VIP, Status)
+
+# Compound-to-KEGG ID mapping (to check what mapped)
+kegg_map_table <- results_with_ids %>% dplyr::select(Metabolite, KEGG_ID)
+
+# Counts for the Results text
+cat("Significant at BH-adjusted p < 0.05:", nrow(s4b_table),
+    "(up:", sum(s4b_table$Status == "Upregulated"),
+    "down:", sum(s4b_table$Status == "Downregulated"), ")\n")
+cat("Significant at raw p < 0.05:", nrow(sig_table), "\n")
+cat("Raw-p metabolites mapped to KEGG IDs:", length(sig_ids), "\n")
+
+# 9. Save every table locally as CSV (runs before the Google Sheets step, which needs a login)
+write.csv(sig_table, file.path(results_dir, "Significant_rawP.csv"), row.names = FALSE)
+write.csv(up_table, file.path(results_dir, "Upregulated.csv"), row.names = FALSE)
+write.csv(down_table, file.path(results_dir, "Downregulated.csv"), row.names = FALSE)
+write.csv(top10_table, file.path(results_dir, "Top10_Biomarkers.csv"), row.names = FALSE)
+write.csv(kegg_table, file.path(results_dir, "KEGG_Enrichment.csv"), row.names = FALSE)
+write.csv(s4a_table, file.path(results_dir, "S4a_metabolomics_full_results.csv"), row.names = FALSE)
+write.csv(s4b_table, file.path(results_dir, "S4b_significant_metabolites.csv"), row.names = FALSE)
+write.csv(kegg_map_table, file.path(results_dir, "Metabolite_KEGG_ID_mapping.csv"), row.names = FALSE)
+
+# Save session info once
+writeLines(capture.output(sessionInfo()), file.path(results_dir, "SessionInfo.txt"))
+cat("All figures and CSV files saved in:", normalizePath(results_dir), "\n")
+
+# 10. Export Results to Google Sheets (requires a Google login in the browser)
+library(googlesheets4)
+
+# Authenticate your Google account (will open browser)
+gs4_auth()
 
 # Create Google Sheet with multiple tabs
 sheet_url <- gs4_create(
@@ -266,9 +328,10 @@ sheet_url <- gs4_create(
     Upregulated = up_table,
     Downregulated = down_table,
     Top10_Biomarkers = top10_table,
-    KEGG_Enrichment = kegg_table
+    KEGG_Enrichment = kegg_table,
+    S4a_Full_Results = s4a_table,
+    S4b_Significant = s4b_table,
+    KEGG_ID_Mapping = kegg_map_table
   )
 )
 cat("Results successfully saved to Google Sheets:\n", sheet_url, "\n")
-# Save session info once
-writeLines(capture.output(sessionInfo()), file.path(results_dir, "SessionInfo.txt"))
