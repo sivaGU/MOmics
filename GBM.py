@@ -586,7 +586,6 @@ def process_demo_dataframe(df):
 
 # Reproducibility check: GUI vs training pipeline on the full discovery cohort
 
-_PIPELINE_PREDS = _HERE / "pipeline_predictions.csv"   # exported from the training notebook
 REPRO_TOL = 1e-6
 # pipeline CSV column -> GUI result column
 REPRO_MAP = {
@@ -607,12 +606,61 @@ REPRO_LABELS = {
 
 @st.cache_data
 def score_full_discovery():
-    """Score every discovery sample (99 GBM + 10 GTEx normal) through the GUI code path."""
+    """Score every discovery sample (99 GBM + 10 GTEx normal) two ways:
+    (1) GUI path: one sample at a time through score_sample, exactly as a user would;
+    (2) pipeline path: the whole cohort as matrices, straight from the locked pickle,
+        the way the training pipeline produces batch predictions."""
     df_data, sample_ids, true_labels = load_demo_data()
-    res = process_demo_dataframe(df_data)
-    res.insert(0, "Sample_ID", [str(s) for s in sample_ids])
-    res.insert(1, "True_Label", true_labels)
-    return res
+    ids = [str(x) for x in sample_ids]
+
+    gui = process_demo_dataframe(df_data)
+    gui.insert(0, "Sample_ID", ids)
+    gui.insert(1, "True_Label", true_labels)
+
+    ref = {"Sample_ID": ids}
+    probs = []
+    for key in ("rna", "prot", "met"):
+        feats = LAYER_FEATURES[key]
+        X = df_data.reindex(columns=[f"{key}_{f}" for f in feats]).apply(pd.to_numeric, errors="coerce")
+        X.columns = feats
+        present = X.notna().any(axis=1).to_numpy()
+        if key == "rna" and RNA_LOG1P:
+            X = np.log1p(X)
+        mean = pd.Series([ZSCORE_PARAMS[key]["mean"].get(f) for f in feats], index=feats, dtype=float)
+        std = pd.Series([ZSCORE_PARAMS[key]["std"].get(f) for f in feats], index=feats, dtype=float)
+        usable = np.isfinite(mean) & np.isfinite(std) & (std > 0)
+        Z = ((X - mean) / std.where(usable)).fillna(0.0)
+        p = SUB_MODELS[key].predict_proba(Z.to_numpy())[:, 1]
+        p = np.where(present, p, np.nan)
+        ref[f"{key}_prob"] = p
+        probs.append(p)
+    raw = FUSION_MODEL.predict_proba(np.column_stack(probs))[:, 1]
+    ref["fusion_raw"] = raw
+    ref["calibrated"] = np.asarray(CALIBRATOR.predict(raw), dtype=float)
+    return gui, pd.DataFrame(ref)
+
+
+def _auc(y, score):
+    """Rank-based ROC AUC (no sklearn dependency)."""
+    y = np.asarray(y, dtype=bool)
+    s = pd.Series(score).rank().to_numpy()
+    n1, n0 = y.sum(), (~y).sum()
+    if n1 == 0 or n0 == 0:
+        return np.nan
+    return float((s[y].sum() - n1 * (n1 + 1) / 2) / (n1 * n0))
+
+
+def gui_discovery_metrics(gui):
+    y = (gui["True_Label"] == "GBM").to_numpy()
+    raw = pd.to_numeric(gui["Risk Score (Raw)"], errors="coerce").to_numpy()
+    pred = gui["Binary Call"].to_numpy() == "GBM"
+    tp, tn = int((pred & y).sum()), int((~pred & ~y).sum())
+    return {
+        "AUC": _auc(y, raw),
+        "Accuracy": float((pred == y).mean()),
+        "Sensitivity": tp / max(int(y.sum()), 1),
+        "Specificity": tn / max(int((~y).sum()), 1),
+    }
 
 
 def compare_with_pipeline(gui, pipe_df, tol=REPRO_TOL):
@@ -674,48 +722,7 @@ def compare_with_pipeline(gui, pipe_df, tol=REPRO_TOL):
     return summary, checks, per
 
 
-def render_reproducibility():
-    st.subheader("Reproducibility: GUI vs training pipeline")
-    st.write(
-        "This check scores **all discovery samples** (99 CPTAC-3 GBM + 10 GTEx normal brain) "
-        "through the same code the User Analysis page uses, and compares each output with the "
-        "predictions exported from the training pipeline for the same samples. Matching values "
-        "show that the GUI applies the same preprocessing (log1p, z-scoring, layer routing, "
-        "missing-value handling), sub-models, fusion and calibration as the published model."
-    )
-
-    pipe_df = None
-    if _PIPELINE_PREDS.exists():
-        pipe_df = pd.read_csv(_PIPELINE_PREDS)
-        st.caption(f"Using `{_PIPELINE_PREDS.name}` from the repository.")
-    else:
-        st.info(
-            f"`{_PIPELINE_PREDS.name}` was not found in the repository. Upload the training "
-            "pipeline's predictions below. Required: `Sample_ID`; any of `rna_prob`, `prot_prob`, "
-            "`met_prob`, `fusion_raw`, `calibrated` (NaN where a layer is missing)."
-        )
-        up = st.file_uploader("Upload pipeline predictions (CSV)", type="csv", key="repro_upload")
-        if up is not None:
-            pipe_df = pd.read_csv(up)
-
-    if pipe_df is None:
-        return
-    if "Sample_ID" not in pipe_df.columns:
-        st.error("The predictions file needs a `Sample_ID` column.")
-        return
-    if not any(c in pipe_df.columns for c in REPRO_MAP):
-        st.error(f"No comparable columns found. Expected any of: {', '.join(REPRO_MAP)}.")
-        return
-
-    if st.button("Run reproducibility check", type="primary", key="btn_repro"):
-        with st.spinner("Scoring the full discovery cohort through the GUI..."):
-            gui = score_full_discovery()
-            st.session_state.repro = compare_with_pipeline(gui, pipe_df)
-
-    if "repro" not in st.session_state:
-        return
-    summary, checks, per = st.session_state.repro
-
+def render_summary_table(summary, checks, per, key):
     (st.success if summary["all_pass"] else st.error)(
         f"**{'PASS' if summary['all_pass'] else 'FAIL'}** — {summary['n_compared']} samples compared "
         f"(tolerance {REPRO_TOL:g})."
@@ -728,16 +735,11 @@ def render_reproducibility():
     if len(num):
         c[2].metric("Largest |difference|", f"{num['Max |GUI − pipeline|'].max():.2e}")
 
-    if summary["only_gui"]:
-        st.warning(f"{len(summary['only_gui'])} sample(s) scored by the GUI are missing from the "
-                   f"pipeline file: {', '.join(summary['only_gui'][:10])}"
-                   f"{'...' if len(summary['only_gui']) > 10 else ''}")
-    if summary["only_pipe"]:
-        st.warning(f"{len(summary['only_pipe'])} sample(s) in the pipeline file were not found in "
-                   f"the discovery data: {', '.join(summary['only_pipe'][:10])}"
-                   f"{'...' if len(summary['only_pipe']) > 10 else ''}")
+    for ids, msg in ((summary["only_gui"], "scored by the GUI are missing from the reference"),
+                     (summary["only_pipe"], "in the reference were not found in the discovery data")):
+        if ids:
+            st.warning(f"{len(ids)} sample(s) {msg}: {', '.join(ids[:10])}{'...' if len(ids) > 10 else ''}")
 
-    st.write("#### Summary (supplementary table)")
     show = checks.copy()
     show["Max |GUI − pipeline|"] = [
         f"{int(v)} mismatched" if o.startswith("Binary call") else f"{v:.2e}"
@@ -745,11 +747,7 @@ def render_reproducibility():
     ]
     show["Pass"] = show["Pass"].map({True: "✓", False: "✗"})
     st.dataframe(show, use_container_width=True, hide_index=True)
-    st.download_button("Download summary (CSV)", checks.to_csv(index=False).encode("utf-8"),
-                       file_name="MOmics_gui_reproducibility_summary.csv", mime="text/csv",
-                       key="repro_dl_summary")
 
-    st.write("#### Per-sample comparison")
     if not summary["all_pass"]:
         diff_cols = [c for c in per.columns if c.endswith("|diff|")]
         bad = per[(per[diff_cols] > REPRO_TOL).any(axis=1)] if diff_cols else per.iloc[0:0]
@@ -758,13 +756,67 @@ def render_reproducibility():
         if len(bad):
             st.write(f"{len(bad)} sample(s) differ:")
             st.dataframe(bad, use_container_width=True, hide_index=True)
-    with st.expander("All samples"):
+    with st.expander("Per-sample comparison (all samples)"):
         st.dataframe(per, use_container_width=True, hide_index=True)
-    st.download_button("Download per-sample comparison (CSV)", per.to_csv(index=False).encode("utf-8"),
-                       file_name="MOmics_gui_reproducibility_per_sample.csv", mime="text/csv",
-                       key="repro_dl_per")
-    st.caption("This confirms the GUI reproduces the pipeline's outputs. Because these are training "
-               "samples, it is not an estimate of model performance.")
+
+    d1, d2 = st.columns(2)
+    d1.download_button("Download summary (CSV)", checks.to_csv(index=False).encode("utf-8"),
+                       file_name=f"MOmics_reproducibility_summary_{key}.csv", mime="text/csv",
+                       key=f"repro_dl_sum_{key}")
+    d2.download_button("Download per-sample comparison (CSV)", per.to_csv(index=False).encode("utf-8"),
+                       file_name=f"MOmics_reproducibility_per_sample_{key}.csv", mime="text/csv",
+                       key=f"repro_dl_per_{key}")
+
+
+def render_reproducibility():
+    st.subheader("Reproducibility: GUI vs locked pipeline on the discovery cohort")
+    st.write(
+        "Scores **all discovery samples** (99 CPTAC-3 GBM + 10 GTEx normal brain, from the training "
+        "TSVs in this repository) two ways and compares every output:\n\n"
+        "- **GUI path:** each sample scored individually through the same `score_sample` code the "
+        "User Analysis page uses.\n"
+        "- **Pipeline path:** the whole cohort scored as matrices directly from the locked v11 pipeline "
+        "(frozen z-score parameters → per-layer XGBoost sub-models → fusion → isotonic calibration), "
+        "independently of the GUI's per-sample input handling.\n\n"
+        "Matching values show that the GUI applies the same preprocessing (log1p, z-scoring, layer "
+        "routing, missing-layer handling), models and threshold as the published pipeline."
+    )
+
+    if st.button("Run reproducibility check", type="primary", key="btn_repro"):
+        with st.spinner("Scoring the full discovery cohort..."):
+            gui, ref = score_full_discovery()
+            st.session_state.repro = (gui, compare_with_pipeline(gui, ref))
+
+    if "repro" not in st.session_state:
+        return
+    gui, (summary, checks, per) = st.session_state.repro
+
+    st.write("#### 1. GUI vs locked pipeline (supplementary table)")
+    render_summary_table(summary, checks, per, key="pipeline")
+
+    st.write("#### 2. Discovery performance recomputed from GUI scores")
+    m = gui_discovery_metrics(gui)
+    perf = pd.DataFrame({"Metric": list(m), "Recomputed from GUI": [round(v, 4) for v in m.values()]})
+    st.dataframe(perf, use_container_width=True, hide_index=True)
+    if isinstance(DISCOVERY, dict) and DISCOVERY:
+        st.write("Discovery metrics stored in the locked pipeline:")
+        stored = pd.DataFrame({"Metric": list(DISCOVERY),
+                               "Stored value": [str(v) for v in DISCOVERY.values()]})
+        st.dataframe(stored, use_container_width=True, hide_index=True)
+        st.caption("Stored metrics may come from cross-validation and need not equal the in-sample "
+                   "values above. The recomputed values are on training samples and are optimistic; "
+                   "they are shown for transparency, not as a performance estimate.")
+
+    with st.expander("Optional: compare with predictions exported from the training notebook"):
+        st.write("Upload a CSV with `Sample_ID` and any of `rna_prob`, `prot_prob`, `met_prob`, "
+                 "`fusion_raw`, `calibrated` (NaN where a layer is missing).")
+        up = st.file_uploader("Notebook predictions (CSV)", type="csv", key="repro_upload")
+        if up is not None:
+            nb = pd.read_csv(up)
+            if "Sample_ID" not in nb.columns or not any(c in nb.columns for c in REPRO_MAP):
+                st.error(f"Needs `Sample_ID` and at least one of: {', '.join(REPRO_MAP)}.")
+            else:
+                render_summary_table(*compare_with_pipeline(gui, nb), key="notebook")
 
 
 # Sidebar
