@@ -601,7 +601,7 @@ st.sidebar.markdown(f"")
 st.sidebar.markdown(f"")
 
 st.title("MOmics | GBM Multi-Omics Research Tool")
-st.warning(RUO_NOTICE, icon="⚠️")
+st.warning(RUO_NOTICE, icon="")
 
 
 
