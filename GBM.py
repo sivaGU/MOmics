@@ -316,6 +316,20 @@ def _fmt(val):
     return f"{val:.4f}"
 
 
+def _biomarker_bar(vals, key, title=None, x_label="Raw Value"):
+    """Horizontal bar of biomarker values; safe when vals is empty."""
+    if vals.empty:
+        st.info("No biomarker values were entered for this sample, so there is nothing to plot. "
+                "Blank fields were filled with the training mean for scoring (see QC above).")
+        return
+    plot_df = vals.rename_axis("Biomarker").reset_index(name="Value")
+    fig = px.bar(plot_df, x="Value", y="Biomarker", orientation="h",
+                 color="Value", color_continuous_scale="Viridis",
+                 title=title, labels={"Value": x_label})
+    fig.update_layout(yaxis={"categoryorder": "total ascending"})
+    st.plotly_chart(fig, use_container_width=True, key=key)
+
+
 def render_risk_charts(results, mode="manual", key_prefix=""):
     st.subheader("Model Output (research use only)")
     call_colors = {"GBM-like": "#EF553B", "Non-GBM-like": "#00CC96"}
@@ -438,23 +452,16 @@ def render_dashboard(results, mode="manual", key_prefix="", patient_labels=None)
     with col_r:
         st.write(f"### Biomarker Input Values (Sample {selected})")
         marker_cols = [c for c in results.columns if c not in SCORE_COLS]
-        marker_vals = row[marker_cols].astype(float).dropna().sort_values(ascending=False)
-        fig_top = px.bar(x=marker_vals.values, y=marker_vals.index, orientation="h",
-                         color=marker_vals.values, color_continuous_scale="Viridis",
-                         labels={"x": "Raw Value", "y": "Biomarker"})
-        st.plotly_chart(fig_top, use_container_width=True, key=f"{key_prefix}_pbar_{selected}")
+        marker_vals = pd.to_numeric(row[marker_cols], errors="coerce").dropna()
+        _biomarker_bar(marker_vals, key=f"{key_prefix}_pbar_{selected}")
 
     st.divider()
     col_imp1, col_imp2 = st.columns(2)
 
     with col_imp1:
         st.write("#### Sample Biomarker Values")
-        patient_vals = row[marker_cols].astype(float).dropna().sort_values(ascending=False)
-        fig_pt = px.bar(x=patient_vals.values, y=patient_vals.index, orientation="h",
-                        color=patient_vals.values, color_continuous_scale="Viridis",
-                        title=f"Input Values — Sample {selected}")
-        fig_pt.update_layout(yaxis={"categoryorder": "total ascending"})
-        st.plotly_chart(fig_pt, use_container_width=True, key=f"{key_prefix}_ptop_{selected}")
+        _biomarker_bar(marker_vals, key=f"{key_prefix}_ptop_{selected}",
+                       title=f"Input Values — Sample {selected}")
 
     with col_imp2:
         st.write("#### Global XGBoost Importance")
@@ -594,7 +601,7 @@ st.sidebar.markdown(f"")
 st.sidebar.markdown(f"")
 
 st.title("MOmics | GBM Multi-Omics Research Tool")
-st.warning(RUO_NOTICE, icon="")
+st.warning(RUO_NOTICE, icon="⚠️")
 
 
 
@@ -1006,10 +1013,9 @@ elif page == "Demo Walkthrough":
                 c7.metric("Met",         _fmt(row["Metabolomics Score"]))
 
                 marker_cols = [c for c in st.session_state.demo_results.columns if c not in SCORE_COLS]
-                vals = row[marker_cols].astype(float).dropna().sort_values(ascending=False)
-                fig = px.bar(x=vals.values, y=vals.index, orientation="h",
-                             title=f"Biomarker Values — {demo_labels[sel]}")
-                st.plotly_chart(fig, use_container_width=True)
+                vals = pd.to_numeric(row[marker_cols], errors="coerce").dropna()
+                _biomarker_bar(vals, key=f"tut_bar_{sel}",
+                               title=f"Biomarker Values — {demo_labels[sel]}")
             if st.button("Next: Wrap Up", key="tutorial_next_3"):
                 st.session_state.tutorial_step = 4
                 st.rerun()
