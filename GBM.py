@@ -584,6 +584,189 @@ def process_demo_dataframe(df):
 
 
 
+# Reproducibility check: GUI vs training pipeline on the full discovery cohort
+
+_PIPELINE_PREDS = _HERE / "pipeline_predictions.csv"   # exported from the training notebook
+REPRO_TOL = 1e-6
+# pipeline CSV column -> GUI result column
+REPRO_MAP = {
+    "rna_prob":   "RNA Score",
+    "prot_prob":  "Protein Score",
+    "met_prob":   "Metabolomics Score",
+    "fusion_raw": "Risk Score (Raw)",
+    "calibrated": "Risk Score (Calibrated)",
+}
+REPRO_LABELS = {
+    "rna_prob": "RNA sub-model probability",
+    "prot_prob": "Protein sub-model probability",
+    "met_prob": "Metabolomics sub-model probability",
+    "fusion_raw": "Raw fusion score",
+    "calibrated": "Calibrated probability",
+}
+
+
+@st.cache_data
+def score_full_discovery():
+    """Score every discovery sample (99 GBM + 10 GTEx normal) through the GUI code path."""
+    df_data, sample_ids, true_labels = load_demo_data()
+    res = process_demo_dataframe(df_data)
+    res.insert(0, "Sample_ID", [str(s) for s in sample_ids])
+    res.insert(1, "True_Label", true_labels)
+    return res
+
+
+def compare_with_pipeline(gui, pipe_df, tol=REPRO_TOL):
+    """Per-sample and summary comparison of GUI outputs vs the training pipeline export."""
+    pipe_df = pipe_df.copy()
+    pipe_df["Sample_ID"] = pipe_df["Sample_ID"].astype(str).str.strip()
+    gui_ids, pipe_ids = set(gui["Sample_ID"]), set(pipe_df["Sample_ID"])
+    only_gui, only_pipe = sorted(gui_ids - pipe_ids), sorted(pipe_ids - gui_ids)
+
+    merged = gui.merge(pipe_df, on="Sample_ID", how="inner", suffixes=("", "_pipeline"))
+    per = merged[["Sample_ID", "True_Label"]].copy()
+    rows = []
+
+    for pcol, gcol in REPRO_MAP.items():
+        if pcol not in merged.columns:
+            continue
+        g = pd.to_numeric(merged[gcol], errors="coerce").to_numpy(dtype=float)
+        p = pd.to_numeric(merged[pcol], errors="coerce").to_numpy(dtype=float)
+        both = ~np.isnan(g) & ~np.isnan(p)
+        missing_mismatch = int((np.isnan(g) != np.isnan(p)).sum())
+        diff = np.abs(g - p)
+        max_diff = float(np.nanmax(diff[both])) if both.any() else 0.0
+        per[f"{pcol} (GUI)"] = g
+        per[f"{pcol} (pipeline)"] = p
+        per[f"{pcol} |diff|"] = np.where(both, diff, np.nan)
+        rows.append({
+            "Output": REPRO_LABELS[pcol],
+            "Samples compared": int(both.sum()),
+            "Max |GUI − pipeline|": max_diff,
+            "Missing-value mismatches": missing_mismatch,
+            "Pass": bool(max_diff <= tol and missing_mismatch == 0),
+        })
+
+    # Binary call: pipeline call from its own raw score at the same Youden threshold
+    if "fusion_raw" in merged.columns:
+        pipe_call = np.where(pd.to_numeric(merged["fusion_raw"], errors="coerce") >= THRESHOLD,
+                             "GBM", "Non-GBM")
+        gui_call = merged["Binary Call"].to_numpy()
+        per["Call (GUI)"] = gui_call
+        per["Call (pipeline)"] = pipe_call
+        n_match = int((gui_call == pipe_call).sum())
+        rows.append({
+            "Output": f"Binary call (threshold {THRESHOLD:.4f})",
+            "Samples compared": len(merged),
+            "Max |GUI − pipeline|": float(len(merged) - n_match),
+            "Missing-value mismatches": 0,
+            "Pass": n_match == len(merged),
+        })
+    else:
+        n_match = None
+
+    checks = pd.DataFrame(rows)
+    summary = {
+        "n_gui": len(gui), "n_pipeline": len(pipe_df), "n_compared": len(merged),
+        "only_gui": only_gui, "only_pipe": only_pipe,
+        "n_call_match": n_match,
+        "all_pass": bool(len(checks) and checks["Pass"].all() and not only_gui and not only_pipe),
+    }
+    return summary, checks, per
+
+
+def render_reproducibility():
+    st.subheader("Reproducibility: GUI vs training pipeline")
+    st.write(
+        "This check scores **all discovery samples** (99 CPTAC-3 GBM + 10 GTEx normal brain) "
+        "through the same code the User Analysis page uses, and compares each output with the "
+        "predictions exported from the training pipeline for the same samples. Matching values "
+        "show that the GUI applies the same preprocessing (log1p, z-scoring, layer routing, "
+        "missing-value handling), sub-models, fusion and calibration as the published model."
+    )
+
+    pipe_df = None
+    if _PIPELINE_PREDS.exists():
+        pipe_df = pd.read_csv(_PIPELINE_PREDS)
+        st.caption(f"Using `{_PIPELINE_PREDS.name}` from the repository.")
+    else:
+        st.info(
+            f"`{_PIPELINE_PREDS.name}` was not found in the repository. Upload the training "
+            "pipeline's predictions below. Required: `Sample_ID`; any of `rna_prob`, `prot_prob`, "
+            "`met_prob`, `fusion_raw`, `calibrated` (NaN where a layer is missing)."
+        )
+        up = st.file_uploader("Upload pipeline predictions (CSV)", type="csv", key="repro_upload")
+        if up is not None:
+            pipe_df = pd.read_csv(up)
+
+    if pipe_df is None:
+        return
+    if "Sample_ID" not in pipe_df.columns:
+        st.error("The predictions file needs a `Sample_ID` column.")
+        return
+    if not any(c in pipe_df.columns for c in REPRO_MAP):
+        st.error(f"No comparable columns found. Expected any of: {', '.join(REPRO_MAP)}.")
+        return
+
+    if st.button("Run reproducibility check", type="primary", key="btn_repro"):
+        with st.spinner("Scoring the full discovery cohort through the GUI..."):
+            gui = score_full_discovery()
+            st.session_state.repro = compare_with_pipeline(gui, pipe_df)
+
+    if "repro" not in st.session_state:
+        return
+    summary, checks, per = st.session_state.repro
+
+    (st.success if summary["all_pass"] else st.error)(
+        f"**{'PASS' if summary['all_pass'] else 'FAIL'}** — {summary['n_compared']} samples compared "
+        f"(tolerance {REPRO_TOL:g})."
+    )
+    c = st.columns(3)
+    c[0].metric("Samples compared", f"{summary['n_compared']}/{summary['n_gui']}")
+    if summary["n_call_match"] is not None:
+        c[1].metric("Identical calls", f"{summary['n_call_match']}/{summary['n_compared']}")
+    num = checks[~checks["Output"].str.startswith("Binary call")] if len(checks) else checks
+    if len(num):
+        c[2].metric("Largest |difference|", f"{num['Max |GUI − pipeline|'].max():.2e}")
+
+    if summary["only_gui"]:
+        st.warning(f"{len(summary['only_gui'])} sample(s) scored by the GUI are missing from the "
+                   f"pipeline file: {', '.join(summary['only_gui'][:10])}"
+                   f"{'...' if len(summary['only_gui']) > 10 else ''}")
+    if summary["only_pipe"]:
+        st.warning(f"{len(summary['only_pipe'])} sample(s) in the pipeline file were not found in "
+                   f"the discovery data: {', '.join(summary['only_pipe'][:10])}"
+                   f"{'...' if len(summary['only_pipe']) > 10 else ''}")
+
+    st.write("#### Summary (supplementary table)")
+    show = checks.copy()
+    show["Max |GUI − pipeline|"] = [
+        f"{int(v)} mismatched" if o.startswith("Binary call") else f"{v:.2e}"
+        for o, v in zip(show["Output"], show["Max |GUI − pipeline|"])
+    ]
+    show["Pass"] = show["Pass"].map({True: "✓", False: "✗"})
+    st.dataframe(show, use_container_width=True, hide_index=True)
+    st.download_button("Download summary (CSV)", checks.to_csv(index=False).encode("utf-8"),
+                       file_name="MOmics_gui_reproducibility_summary.csv", mime="text/csv",
+                       key="repro_dl_summary")
+
+    st.write("#### Per-sample comparison")
+    if not summary["all_pass"]:
+        diff_cols = [c for c in per.columns if c.endswith("|diff|")]
+        bad = per[(per[diff_cols] > REPRO_TOL).any(axis=1)] if diff_cols else per.iloc[0:0]
+        if "Call (GUI)" in per:
+            bad = pd.concat([bad, per[per["Call (GUI)"] != per["Call (pipeline)"]]]).drop_duplicates("Sample_ID")
+        if len(bad):
+            st.write(f"{len(bad)} sample(s) differ:")
+            st.dataframe(bad, use_container_width=True, hide_index=True)
+    with st.expander("All samples"):
+        st.dataframe(per, use_container_width=True, hide_index=True)
+    st.download_button("Download per-sample comparison (CSV)", per.to_csv(index=False).encode("utf-8"),
+                       file_name="MOmics_gui_reproducibility_per_sample.csv", mime="text/csv",
+                       key="repro_dl_per")
+    st.caption("This confirms the GUI reproduces the pipeline's outputs. Because these are training "
+               "samples, it is not an estimate of model performance.")
+
+
 # Sidebar
 
 st.sidebar.title("MOmics")
@@ -601,7 +784,7 @@ st.sidebar.markdown(f"")
 st.sidebar.markdown(f"")
 
 st.title("MOmics | GBM Multi-Omics Research Tool")
-st.warning(RUO_NOTICE, icon="")
+st.warning(RUO_NOTICE, icon="⚠️")
 
 
 
@@ -643,7 +826,8 @@ diagnoses, and has not been validated for clinical use.
 
 elif page == "Documentation":
     st.header("System Documentation")
-    doc_tabs = st.tabs(["Overview", "GUI User Guide", "Model Architecture", "Feature Reference"])
+    doc_tabs = st.tabs(["Overview", "GUI User Guide", "Model Architecture", "Feature Reference",
+                        "Reproducibility"])
     with doc_tabs[0]:
         st.markdown(OVERVIEW)
     with doc_tabs[1]:
@@ -662,6 +846,8 @@ elif page == "Documentation":
         if layer_filter != "All":
             ref_df = ref_df[ref_df["Layer"] == layer_filter]
         st.dataframe(ref_df, use_container_width=True, hide_index=True)
+    with doc_tabs[4]:
+        render_reproducibility()
 
 
 # User analysis/main page
