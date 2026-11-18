@@ -32,8 +32,10 @@ volcano_top_n <- 6
 ppi_top_n <- 200
 
 # 2.  Import data sets for analysis 
+# CHANGED: file lookup only, so v4.0 / v4_0 file names both work
+count_file <- list.files(data_dir, pattern = "^rnaseq_washu_readcount.*\\.tsv$", full.names = TRUE)[1]
 counts <- read.table(
-  file.path(data_dir, "rnaseq_washu_readcount.v4.0.tsv"),
+  count_file,
   header = TRUE, sep = "\t", row.names = 1, check.names = FALSE
 )
 count_data <- counts[, 8:ncol(counts)]
@@ -41,8 +43,8 @@ count_data <- counts[, 8:ncol(counts)]
 # 3. Sample metadata
 sample_ids <- colnames(count_data)
 condition <- case_when(
-  grepl("^C3N", sample_ids) ~ "Normal",
-  grepl("^C3L|^PT-", sample_ids) ~ "Tumor",
+  grepl("^PT-", sample_ids) ~ "Normal",
+  grepl("^C3L|^C3N", sample_ids) ~ "Tumor",
   TRUE ~ NA_character_
 )
 keep <- !grepl("^exo", sample_ids)
@@ -64,7 +66,7 @@ res_df <- as.data.frame(res) %>% rownames_to_column("ensembl") %>% filter(!is.na
 
 # 5. Gene annotation
 res_df$ensembl_clean <- sub("\\..*$", "", res_df$ensembl)
-res_df$symbol <- mapIds(org.Hs.eg.db, keys = res_df$ensembl_clean,
+res_dfsymbol<-mapIds(org.Hs.eg.db,keys=resdfensembl_clean,
                         column = "SYMBOL", keytype = "ENSEMBL", multiVals = "first")
 sig_genes <- res_df %>% filter(padj < padj_cutoff & abs(log2FoldChange) > log2fc_cutoff)
 
@@ -109,7 +111,7 @@ entrez_bg <- mapIds(org.Hs.eg.db, keys = sub("\\..*$", "", rownames(dds)), colum
 kk <- enrichKEGG(gene = entrez_sig, universe = entrez_bg, organism = "hsa",
                  keyType = "ncbi-geneid", pvalueCutoff = 0.01)
 kegg_df <- as.data.frame(kk)
-kegg_df$log10p_raw <- -log10(kegg_df$pvalue)
+kegg_dflog10praw<--log10(keggdfpvalue)
 top_kegg <- kegg_df[1:10, ]
 
 kegg_plot <- ggplot(top_kegg, aes(x = reorder(Description, log10p_raw), y = log10p_raw)) +
@@ -125,10 +127,10 @@ ggsave(file.path(results_dir, "Figure4_KEGG_Pathway_Enrichment.png"), plot = keg
 # 9. Biomarker analysis (Z-score) and Graph 
 vsd_mat <- assay(vsd)
 rownames(vsd_mat) <- sub("\\..*$", "", rownames(vsd_mat))
-genes_use <- sig_genes$ensembl_clean[sig_genes$ensembl_clean %in% rownames(vsd_mat)]
+genes_use <- sig_genesensemblclean[siggenesensembl_clean %in% rownames(vsd_mat)]
 vsd_mat_subset <- vsd_mat[genes_use, , drop = FALSE]
-gene_symbols <- make.unique(ifelse(is.na(sig_genes$symbol[match(genes_use, sig_genes$ensembl_clean)]),
-                                   genes_use, sig_genes$symbol[match(genes_use, sig_genes$ensembl_clean)]))
+gene_symbols <- make.unique(ifelse(is.na(sig_genessymbol[match(genesuse,siggenesensembl_clean)]),
+                                   genes_use, sig_genessymbol[match(genesuse,siggenesensembl_clean)]))
 rownames(vsd_mat_subset) <- gene_symbols
 zscore_mat <- t(scale(t(vsd_mat_subset)))
 
@@ -158,14 +160,14 @@ string_db <- STRINGdb$new(version="12", species=9606, score_threshold=400)
 genes_mapped <- string_db$map(sig_genes, "symbol", removeUnmappedRows = TRUE)
 top_hits <- genes_mapped %>% arrange(padj) %>% slice_head(n = ppi_top_n) %>% pull(STRING_id)
 interactions <- string_db$get_interactions(top_hits)
-hub_counts <- as.data.frame(table(c(interactions$from, interactions$to)))
+hub_counts <- as.data.frame(table(c(interactionsfrom,interactionsto)))
 colnames(hub_counts) <- c("STRING_id", "Degree")
 hubs_with_data <- merge(hub_counts, genes_mapped[, c("STRING_id", "symbol", "log2FoldChange", "padj")], by = "STRING_id") %>% arrange(desc(Degree))
 top_targets <- head(hubs_with_data %>% filter(log2FoldChange > 0), 10)
 
 png(file.path(results_dir, "PPI_Drug_Targets_Network.png"), width = 3*300, height = 3*300, res = 300)
 par(mar = c(0, 0, 0, 0))
-string_db$plot_network(top_targets$STRING_id)
+string_dbplotnetwork(toptargetsSTRING_id)
 dev.off()
 
 # 11. Export results to Google Sheets
