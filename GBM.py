@@ -125,8 +125,9 @@ THRESHOLD_CAPTION = (
     "(~4.6% GBM prevalence) and is not a risk estimate for an individual. Research use only."
 )
 
-# Indices the full 109-sample used for the demo for condensed and better representation
-DEMO_INDICES = [0, 13, 20, 104]
+# Four training samples shown in the demo (chosen by ID so they never shift):
+# 3 CPTAC-3 GBM tumours with all three layers + 1 GTEx normal brain with RNA + protein only
+DEMO_SAMPLES = ["C3L-00365", "C3L-01149", "C3L-01887", "PT-QVJO"]
 
 
 
@@ -503,9 +504,11 @@ def build_reference_table():
 
 
 
-# Training files for demo section 
-# Full cohort of the  99 GBM (CPTAC-3) + 10 GTEx normal brain = 109 samples.
-# The demo walkthrough displays only DEMO_INDICES = [0, 13, 20, 104] because storage reasons.
+# Training files for demo section
+# Training cohort = 99 GBM (CPTAC-3) + 10 GTEx normal brain = 109 samples: every sample with
+# RNA and/or protein data. The metabolome TSV also holds 5 metabolomics-only CPTAC samples
+# (C3L-01839, C3N-01370, C3N-01817, C3N-01850, C3N-03187) that were not in the training set,
+# so they are excluded here. The demo walkthrough shows only the 4 DEMO_SAMPLES for readability.
 # RNA and protein features overlap in symbol (BSN, PCLO, PTPRT, CIT) so
 # they are stored in rna_/prot_/met_ prefixed columns to prevent mixing.
 
@@ -528,7 +531,7 @@ def load_demo_data():
     met_cols  = set(c for c in met_raw.columns  if c.startswith(("C3", "PT-")))
     label_map = dict(zip(manifest["case"], manifest["sample_type"]))
 
-    all_samples = sorted(rna_cols | prot_cols | met_cols)
+    all_samples = sorted(rna_cols | prot_cols)   # 109 training samples (see note above)
     rows = []
     for s in all_samples:
         true_label = "GBM" if label_map.get(s, "") == "tumor" else "Normal"
@@ -549,8 +552,8 @@ def load_demo_data():
 
 
 def _filter_demo(df_data, sample_ids, true_labels):
-    """Slice full cohort to DEMO_INDICES only, reset index."""
-    idx = DEMO_INDICES
+    """Slice the training cohort to DEMO_SAMPLES only, reset index."""
+    idx = [sample_ids.index(s) for s in DEMO_SAMPLES if s in sample_ids]
     df_out      = df_data.iloc[idx].reset_index(drop=True)
     ids_out     = [sample_ids[i]   for i in idx]
     labels_out  = [true_labels[i]  for i in idx]
@@ -582,241 +585,6 @@ def process_demo_dataframe(df):
 
     return pd.DataFrame(results)
 
-
-
-# Reproducibility check: GUI vs training pipeline on the full discovery cohort
-
-REPRO_TOL = 1e-6
-# pipeline CSV column -> GUI result column
-REPRO_MAP = {
-    "rna_prob":   "RNA Score",
-    "prot_prob":  "Protein Score",
-    "met_prob":   "Metabolomics Score",
-    "fusion_raw": "Risk Score (Raw)",
-    "calibrated": "Risk Score (Calibrated)",
-}
-REPRO_LABELS = {
-    "rna_prob": "RNA sub-model probability",
-    "prot_prob": "Protein sub-model probability",
-    "met_prob": "Metabolomics sub-model probability",
-    "fusion_raw": "Raw fusion score",
-    "calibrated": "Calibrated probability",
-}
-
-
-@st.cache_data
-def score_full_discovery():
-    """Score every discovery sample (99 GBM + 10 GTEx normal) two ways:
-    (1) GUI path: one sample at a time through score_sample, exactly as a user would;
-    (2) pipeline path: the whole cohort as matrices, straight from the locked pickle,
-        the way the training pipeline produces batch predictions."""
-    df_data, sample_ids, true_labels = load_demo_data()
-    ids = [str(x) for x in sample_ids]
-
-    gui = process_demo_dataframe(df_data)
-    gui.insert(0, "Sample_ID", ids)
-    gui.insert(1, "True_Label", true_labels)
-
-    ref = {"Sample_ID": ids}
-    probs = []
-    for key in ("rna", "prot", "met"):
-        feats = LAYER_FEATURES[key]
-        X = df_data.reindex(columns=[f"{key}_{f}" for f in feats]).apply(pd.to_numeric, errors="coerce")
-        X.columns = feats
-        present = X.notna().any(axis=1).to_numpy()
-        if key == "rna" and RNA_LOG1P:
-            X = np.log1p(X)
-        mean = pd.Series([ZSCORE_PARAMS[key]["mean"].get(f) for f in feats], index=feats, dtype=float)
-        std = pd.Series([ZSCORE_PARAMS[key]["std"].get(f) for f in feats], index=feats, dtype=float)
-        usable = np.isfinite(mean) & np.isfinite(std) & (std > 0)
-        Z = ((X - mean) / std.where(usable)).fillna(0.0)
-        p = SUB_MODELS[key].predict_proba(Z.to_numpy())[:, 1]
-        p = np.where(present, p, np.nan)
-        ref[f"{key}_prob"] = p
-        probs.append(p)
-    raw = FUSION_MODEL.predict_proba(np.column_stack(probs))[:, 1]
-    ref["fusion_raw"] = raw
-    ref["calibrated"] = np.asarray(CALIBRATOR.predict(raw), dtype=float)
-    return gui, pd.DataFrame(ref)
-
-
-def _auc(y, score):
-    """Rank-based ROC AUC (no sklearn dependency)."""
-    y = np.asarray(y, dtype=bool)
-    s = pd.Series(score).rank().to_numpy()
-    n1, n0 = y.sum(), (~y).sum()
-    if n1 == 0 or n0 == 0:
-        return np.nan
-    return float((s[y].sum() - n1 * (n1 + 1) / 2) / (n1 * n0))
-
-
-def gui_discovery_metrics(gui):
-    y = (gui["True_Label"] == "GBM").to_numpy()
-    raw = pd.to_numeric(gui["Risk Score (Raw)"], errors="coerce").to_numpy()
-    pred = gui["Binary Call"].to_numpy() == "GBM"
-    tp, tn = int((pred & y).sum()), int((~pred & ~y).sum())
-    return {
-        "AUC": _auc(y, raw),
-        "Accuracy": float((pred == y).mean()),
-        "Sensitivity": tp / max(int(y.sum()), 1),
-        "Specificity": tn / max(int((~y).sum()), 1),
-    }
-
-
-def compare_with_pipeline(gui, pipe_df, tol=REPRO_TOL):
-    """Per-sample and summary comparison of GUI outputs vs the training pipeline export."""
-    pipe_df = pipe_df.copy()
-    pipe_df["Sample_ID"] = pipe_df["Sample_ID"].astype(str).str.strip()
-    gui_ids, pipe_ids = set(gui["Sample_ID"]), set(pipe_df["Sample_ID"])
-    only_gui, only_pipe = sorted(gui_ids - pipe_ids), sorted(pipe_ids - gui_ids)
-
-    merged = gui.merge(pipe_df, on="Sample_ID", how="inner", suffixes=("", "_pipeline"))
-    per = merged[["Sample_ID", "True_Label"]].copy()
-    rows = []
-
-    for pcol, gcol in REPRO_MAP.items():
-        if pcol not in merged.columns:
-            continue
-        g = pd.to_numeric(merged[gcol], errors="coerce").to_numpy(dtype=float)
-        p = pd.to_numeric(merged[pcol], errors="coerce").to_numpy(dtype=float)
-        both = ~np.isnan(g) & ~np.isnan(p)
-        missing_mismatch = int((np.isnan(g) != np.isnan(p)).sum())
-        diff = np.abs(g - p)
-        max_diff = float(np.nanmax(diff[both])) if both.any() else 0.0
-        per[f"{pcol} (GUI)"] = g
-        per[f"{pcol} (pipeline)"] = p
-        per[f"{pcol} |diff|"] = np.where(both, diff, np.nan)
-        rows.append({
-            "Output": REPRO_LABELS[pcol],
-            "Samples compared": int(both.sum()),
-            "Max |GUI − pipeline|": max_diff,
-            "Missing-value mismatches": missing_mismatch,
-            "Pass": bool(max_diff <= tol and missing_mismatch == 0),
-        })
-
-    # Binary call: pipeline call from its own raw score at the same Youden threshold
-    if "fusion_raw" in merged.columns:
-        pipe_call = np.where(pd.to_numeric(merged["fusion_raw"], errors="coerce") >= THRESHOLD,
-                             "GBM", "Non-GBM")
-        gui_call = merged["Binary Call"].to_numpy()
-        per["Call (GUI)"] = gui_call
-        per["Call (pipeline)"] = pipe_call
-        n_match = int((gui_call == pipe_call).sum())
-        rows.append({
-            "Output": f"Binary call (threshold {THRESHOLD:.4f})",
-            "Samples compared": len(merged),
-            "Max |GUI − pipeline|": float(len(merged) - n_match),
-            "Missing-value mismatches": 0,
-            "Pass": n_match == len(merged),
-        })
-    else:
-        n_match = None
-
-    checks = pd.DataFrame(rows)
-    summary = {
-        "n_gui": len(gui), "n_pipeline": len(pipe_df), "n_compared": len(merged),
-        "only_gui": only_gui, "only_pipe": only_pipe,
-        "n_call_match": n_match,
-        "all_pass": bool(len(checks) and checks["Pass"].all() and not only_gui and not only_pipe),
-    }
-    return summary, checks, per
-
-
-def render_summary_table(summary, checks, per, key):
-    (st.success if summary["all_pass"] else st.error)(
-        f"**{'PASS' if summary['all_pass'] else 'FAIL'}** — {summary['n_compared']} samples compared "
-        f"(tolerance {REPRO_TOL:g})."
-    )
-    c = st.columns(3)
-    c[0].metric("Samples compared", f"{summary['n_compared']}/{summary['n_gui']}")
-    if summary["n_call_match"] is not None:
-        c[1].metric("Identical calls", f"{summary['n_call_match']}/{summary['n_compared']}")
-    num = checks[~checks["Output"].str.startswith("Binary call")] if len(checks) else checks
-    if len(num):
-        c[2].metric("Largest |difference|", f"{num['Max |GUI − pipeline|'].max():.2e}")
-
-    for ids, msg in ((summary["only_gui"], "scored by the GUI are missing from the reference"),
-                     (summary["only_pipe"], "in the reference were not found in the discovery data")):
-        if ids:
-            st.warning(f"{len(ids)} sample(s) {msg}: {', '.join(ids[:10])}{'...' if len(ids) > 10 else ''}")
-
-    show = checks.copy()
-    show["Max |GUI − pipeline|"] = [
-        f"{int(v)} mismatched" if o.startswith("Binary call") else f"{v:.2e}"
-        for o, v in zip(show["Output"], show["Max |GUI − pipeline|"])
-    ]
-    show["Pass"] = show["Pass"].map({True: "✓", False: "✗"})
-    st.dataframe(show, use_container_width=True, hide_index=True)
-
-    if not summary["all_pass"]:
-        diff_cols = [c for c in per.columns if c.endswith("|diff|")]
-        bad = per[(per[diff_cols] > REPRO_TOL).any(axis=1)] if diff_cols else per.iloc[0:0]
-        if "Call (GUI)" in per:
-            bad = pd.concat([bad, per[per["Call (GUI)"] != per["Call (pipeline)"]]]).drop_duplicates("Sample_ID")
-        if len(bad):
-            st.write(f"{len(bad)} sample(s) differ:")
-            st.dataframe(bad, use_container_width=True, hide_index=True)
-    with st.expander("Per-sample comparison (all samples)"):
-        st.dataframe(per, use_container_width=True, hide_index=True)
-
-    d1, d2 = st.columns(2)
-    d1.download_button("Download summary (CSV)", checks.to_csv(index=False).encode("utf-8"),
-                       file_name=f"MOmics_reproducibility_summary_{key}.csv", mime="text/csv",
-                       key=f"repro_dl_sum_{key}")
-    d2.download_button("Download per-sample comparison (CSV)", per.to_csv(index=False).encode("utf-8"),
-                       file_name=f"MOmics_reproducibility_per_sample_{key}.csv", mime="text/csv",
-                       key=f"repro_dl_per_{key}")
-
-
-def render_reproducibility():
-    st.subheader("Reproducibility: GUI vs locked pipeline on the discovery cohort")
-    st.write(
-        "Scores **all discovery samples** (99 CPTAC-3 GBM + 10 GTEx normal brain, from the training "
-        "TSVs in this repository) two ways and compares every output:\n\n"
-        "- **GUI path:** each sample scored individually through the same `score_sample` code the "
-        "User Analysis page uses.\n"
-        "- **Pipeline path:** the whole cohort scored as matrices directly from the locked v11 pipeline "
-        "(frozen z-score parameters → per-layer XGBoost sub-models → fusion → isotonic calibration), "
-        "independently of the GUI's per-sample input handling.\n\n"
-        "Matching values show that the GUI applies the same preprocessing (log1p, z-scoring, layer "
-        "routing, missing-layer handling), models and threshold as the published pipeline."
-    )
-
-    if st.button("Run reproducibility check", type="primary", key="btn_repro"):
-        with st.spinner("Scoring the full discovery cohort..."):
-            gui, ref = score_full_discovery()
-            st.session_state.repro = (gui, compare_with_pipeline(gui, ref))
-
-    if "repro" not in st.session_state:
-        return
-    gui, (summary, checks, per) = st.session_state.repro
-
-    st.write("#### 1. GUI vs locked pipeline (supplementary table)")
-    render_summary_table(summary, checks, per, key="pipeline")
-
-    st.write("#### 2. Discovery performance recomputed from GUI scores")
-    m = gui_discovery_metrics(gui)
-    perf = pd.DataFrame({"Metric": list(m), "Recomputed from GUI": [round(v, 4) for v in m.values()]})
-    st.dataframe(perf, use_container_width=True, hide_index=True)
-    if isinstance(DISCOVERY, dict) and DISCOVERY:
-        st.write("Discovery metrics stored in the locked pipeline:")
-        stored = pd.DataFrame({"Metric": list(DISCOVERY),
-                               "Stored value": [str(v) for v in DISCOVERY.values()]})
-        st.dataframe(stored, use_container_width=True, hide_index=True)
-        st.caption("Stored metrics may come from cross-validation and need not equal the in-sample "
-                   "values above. The recomputed values are on training samples and are optimistic; "
-                   "they are shown for transparency, not as a performance estimate.")
-
-    with st.expander("Optional: compare with predictions exported from the training notebook"):
-        st.write("Upload a CSV with `Sample_ID` and any of `rna_prob`, `prot_prob`, `met_prob`, "
-                 "`fusion_raw`, `calibrated` (NaN where a layer is missing).")
-        up = st.file_uploader("Notebook predictions (CSV)", type="csv", key="repro_upload")
-        if up is not None:
-            nb = pd.read_csv(up)
-            if "Sample_ID" not in nb.columns or not any(c in nb.columns for c in REPRO_MAP):
-                st.error(f"Needs `Sample_ID` and at least one of: {', '.join(REPRO_MAP)}.")
-            else:
-                render_summary_table(*compare_with_pipeline(gui, nb), key="notebook")
 
 
 # Sidebar
@@ -878,8 +646,7 @@ diagnoses, and has not been validated for clinical use.
 
 elif page == "Documentation":
     st.header("System Documentation")
-    doc_tabs = st.tabs(["Overview", "GUI User Guide", "Model Architecture", "Feature Reference",
-                        "Reproducibility"])
+    doc_tabs = st.tabs(["Overview", "GUI User Guide", "Model Architecture", "Feature Reference"])
     with doc_tabs[0]:
         st.markdown(OVERVIEW)
     with doc_tabs[1]:
@@ -898,8 +665,6 @@ elif page == "Documentation":
         if layer_filter != "All":
             ref_df = ref_df[ref_df["Layer"] == layer_filter]
         st.dataframe(ref_df, use_container_width=True, hide_index=True)
-    with doc_tabs[4]:
-        render_reproducibility()
 
 
 # User analysis/main page
@@ -1136,6 +901,11 @@ elif page == "Demo Walkthrough":
     _all_data, _all_ids, _all_labels = load_demo_data()
     demo_data, demo_sample_ids, demo_true_labels = _filter_demo(_all_data, _all_ids, _all_labels)
     demo_labels = [f"{sid} ({lbl})" for sid, lbl in zip(demo_sample_ids, demo_true_labels)]
+
+    def _score_demo():
+        res = process_demo_dataframe(demo_data)
+        res.insert(0, "Sample ID", demo_sample_ids)
+        return res
     st.divider()
 
     demo_mode = st.radio(
@@ -1150,7 +920,8 @@ elif page == "Demo Walkthrough":
         st.markdown("""<div class="demo-box demo-success">
         <h4>Real Training Samples Loaded</h4>
         <p><strong>3 GBM tumor samples</strong> (CPTAC-3, all 3 layers) and
-        <strong>1 GTEx normal brain sample</strong> (RNA + Protein only, no metabolomics).
+        <strong>1 GTEx normal brain sample</strong> (RNA + Protein only, no metabolomics),
+        all taken from the model's training data.
         Click "Analyze Sample Patients" to run the full v11 pipeline.</p>
         </div>""", unsafe_allow_html=True)
 
@@ -1162,7 +933,7 @@ elif page == "Demo Walkthrough":
 
         if st.button("Analyze Sample Patients", key="analyze_demo_patients", type="primary"):
             with st.spinner("Running v11 inference pipeline..."):
-                st.session_state.demo_try_results = process_demo_dataframe(demo_data)
+                st.session_state.demo_try_results = _score_demo()
 
         if "demo_try_results" in st.session_state:
             st.markdown("---")
@@ -1188,7 +959,8 @@ elif page == "Demo Walkthrough":
             st.markdown("""<div class="demo-box"><h3>Step 1: The Demo Dataset</h3>
             <p>This demo uses 4 real samples from the v11 training cohort:
             <strong>3 CPTAC-3 GBM tumor samples</strong> and
-            <strong>1 GTEx normal brain sample</strong>.
+            <strong>1 GTEx normal brain sample</strong>. All 4 were used to train the model, so
+            correct calls here are not a measure of performance on new data.
             Layer availability varies — the normal sample has RNA + Protein only (no metabolomics).
             Missing layers pass NaN to the fusion model rather than being imputed.</p></div>""",
                         unsafe_allow_html=True)
@@ -1209,7 +981,7 @@ elif page == "Demo Walkthrough":
                         unsafe_allow_html=True)
             if st.button("Process Sample Data", key="tutorial_analyze", type="primary"):
                 with st.spinner("Running inference..."):
-                    st.session_state.demo_results = process_demo_dataframe(demo_data)
+                    st.session_state.demo_results = _score_demo()
                     st.session_state.tutorial_step = 2
                 st.rerun()
 
@@ -1226,7 +998,7 @@ elif page == "Demo Walkthrough":
                     (tl == "GBM") == (bc == "GBM")
                     for tl, bc in zip(demo_true_labels, res["Binary Call"].tolist())
                 )
-                st.info(f"Concordance with true labels: **{concordant}/{len(demo_true_labels)}**")
+                st.info(f"Agreement with true labels: **{concordant}/{len(demo_true_labels)}** (training samples — not a performance estimate)")
                 render_risk_charts(res, mode="bulk", key_prefix="tutorial")
             if st.button("Next: Individual Patient", key="tutorial_next_2"):
                 st.session_state.tutorial_step = 3
@@ -1276,7 +1048,8 @@ elif page == "Demo Walkthrough":
     elif demo_mode == "Learn by Exploring":
         st.subheader("Free Exploration Mode")
         st.markdown("""<div class="demo-box"><h4>Explore at Your Own Pace</h4>
-        <p>Full interface with 3 real CPTAC GBM samples and 1 GTEx normal brain sample.</p>
+        <p>Full interface with 3 real CPTAC GBM samples and 1 GTEx normal brain sample.
+        All 4 samples were used to train the model.</p>
         </div>""", unsafe_allow_html=True)
 
         exp_tabs = st.tabs(["Sample Analysis", "Learning Resources", "Tips & Tricks"])
@@ -1284,7 +1057,7 @@ elif page == "Demo Walkthrough":
         with exp_tabs[0]:
             if st.button("Load & Analyze Sample Data", key="explore_analyze", type="primary"):
                 with st.spinner("Analyzing..."):
-                    st.session_state.demo_explore_results = process_demo_dataframe(demo_data)
+                    st.session_state.demo_explore_results = _score_demo()
             if "demo_explore_results" in st.session_state:
                 st.success("Sample data analyzed!")
                 res = st.session_state.demo_explore_results
@@ -1292,7 +1065,7 @@ elif page == "Demo Walkthrough":
                     (tl == "GBM") == (bc == "GBM")
                     for tl, bc in zip(demo_true_labels, res["Binary Call"].tolist())
                 )
-                st.info(f"Concordance with true labels: **{concordant}/{len(demo_true_labels)}**")
+                st.info(f"Agreement with true labels: **{concordant}/{len(demo_true_labels)}** (training samples — not a performance estimate)")
                 st.divider()
                 render_dashboard(res, mode="bulk", key_prefix="explore", patient_labels=demo_labels)
 
